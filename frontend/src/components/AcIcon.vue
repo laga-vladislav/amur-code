@@ -1,5 +1,6 @@
 <template>
   <svg
+    :class="{ spin: name === 'spinner' }"
     :width="size"
     :height="size"
     viewBox="0 0 24 24"
@@ -62,6 +63,7 @@ const PATHS = {
   link: '<path d="M10 14a5 5 0 010-7l3-3a5 5 0 017 7l-1 1"/><path d="M14 10a5 5 0 010 7l-3 3a5 5 0 01-7-7l1-1"/>',
   type: '<path d="M5 7V5h14v2M9 5v14M9 19h6"/>',
   hash: '<path d="M4 9h16M4 15h16M10 4l-4 16M18 4l-4 16"/>',
+  spinner: '<path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/>',
 };
 
 export default {
@@ -78,3 +80,16 @@ export default {
   },
 };
 </script>
+
+<style scoped>
+.spin {
+  animation: spin 1s linear infinite;
+}
+</style>
+
+<style>
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+</style>

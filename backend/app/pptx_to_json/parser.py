@@ -44,67 +44,129 @@ def parse_pptx(source: str | UploadFile | bytes | bytearray) -> dict[str, Any]:
     prs = _open_presentation(source)
     slides_data: list[dict[str, Any]] = []
 
-    for index, slide in enumerate(prs.slides):
-        elements: list[dict[str, Any]] = []
+    # Parse slide layouts from masters instead of slides
+    if prs.slide_masters:
+        master = prs.slide_masters[0]
+        for index, layout in enumerate(master.slide_layouts):
+            elements: list[dict[str, Any]] = []
 
-        for shape in slide.shapes:
-            bbox = {
-                "x": int_value(shape.left),
-                "y": int_value(shape.top),
-                "width": int_value(shape.width),
-                "height": int_value(shape.height),
-            }
-            element: dict[str, Any] = {
-                "type": "unknown",
-                "text": None,
-                "bbox": bbox,
-                "style": {
-                    "fontSize": None,
-                    "fontFamily": None,
-                    "bold": False,
-                    "color": None,
-                },
-                "isBullet": False,
-            }
+            for shape in layout.shapes:
+                # Skip placeholders
+                if getattr(shape, 'is_placeholder', False):
+                    continue
 
-            if getattr(shape, "has_text_frame", False):
-                text_frame = shape.text_frame
-                element["type"] = "text"
-                element["text"] = shape.text or None
+                bbox = {
+                    "x": int_value(shape.left),
+                    "y": int_value(shape.top),
+                    "width": int_value(shape.width),
+                    "height": int_value(shape.height),
+                }
+                element: dict[str, Any] = {
+                    "type": "unknown",
+                    "text": None,
+                    "bbox": bbox,
+                    "style": {
+                        "fontSize": None,
+                        "fontFamily": None,
+                        "bold": False,
+                        "color": None,
+                    },
+                    "isBullet": False,
+                }
 
-                if text_frame.paragraphs:
-                    paragraph = text_frame.paragraphs[0]
-                    if paragraph.runs:
-                        run = paragraph.runs[0]
-                        font = run.font
-                        font_size = None
-                        if font.size is not None:
-                            font_size = int(round(font.size.pt))
-                        element["style"] = {
-                            "fontSize": font_size,
-                            "fontFamily": font.name,
-                            "bold": bool(font.bold),
-                            "color": rgb_to_hex(font.color.rgb) if getattr(font.color, "rgb", None) else None,
-                        }
+                if getattr(shape, "has_text_frame", False):
+                    text_frame = shape.text_frame
+                    element["type"] = "text"
+                    element["text"] = shape.text or None
 
-                    # element["isBullet"] = any(
-                    #     paragraph.level > 0
-                    #     or bool(getattr(paragraph.paragraph_format, "bullet", False))
-                    #     for paragraph in text_frame.paragraphs
-                    # )
+                    if text_frame.paragraphs:
+                        paragraph = text_frame.paragraphs[0]
+                        if paragraph.runs:
+                            run = paragraph.runs[0]
+                            font = run.font
+                            font_size = None
+                            if font.size is not None:
+                                font_size = int(round(font.size.pt))
+                            element["style"] = {
+                                "fontSize": font_size,
+                                "fontFamily": font.name,
+                                "bold": bool(font.bold),
+                                "color": rgb_to_hex(font.color.rgb) if getattr(font.color, "rgb", None) else None,
+                            }
 
-                    element["isBullet"] = any(
-                        paragraph.level is not None and paragraph.level > 0
-                        for paragraph in text_frame.paragraphs
-                    )
+                        element["isBullet"] = any(
+                            paragraph.level is not None and paragraph.level > 0
+                            for paragraph in text_frame.paragraphs
+                        )
 
-                    
-            elif shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
-                element["type"] = "image"
+                        
+                elif shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
+                    element["type"] = "image"
 
-            elements.append(element)
+                elements.append(element)
 
-        slides_data.append({"index": index, "elements": elements})
+            slides_data.append({"index": index, "elements": elements})
+    else:
+        # Fallback to parsing slides if no masters
+        for index, slide in enumerate(prs.slides):
+            elements: list[dict[str, Any]] = []
+
+            for shape in slide.shapes:
+                # Skip placeholders
+                if getattr(shape, 'is_placeholder', False):
+                    continue
+
+                bbox = {
+                    "x": int_value(shape.left),
+                    "y": int_value(shape.top),
+                    "width": int_value(shape.width),
+                    "height": int_value(shape.height),
+                }
+                element: dict[str, Any] = {
+                    "type": "unknown",
+                    "text": None,
+                    "bbox": bbox,
+                    "style": {
+                        "fontSize": None,
+                        "fontFamily": None,
+                        "bold": False,
+                        "color": None,
+                    },
+                    "isBullet": False,
+                }
+
+                if getattr(shape, "has_text_frame", False):
+                    text_frame = shape.text_frame
+                    element["type"] = "text"
+                    element["text"] = shape.text or None
+
+                    if text_frame.paragraphs:
+                        paragraph = text_frame.paragraphs[0]
+                        if paragraph.runs:
+                            run = paragraph.runs[0]
+                            font = run.font
+                            font_size = None
+                            if font.size is not None:
+                                font_size = int(round(font.size.pt))
+                            element["style"] = {
+                                "fontSize": font_size,
+                                "fontFamily": font.name,
+                                "bold": bool(font.bold),
+                                "color": rgb_to_hex(font.color.rgb) if getattr(font.color, "rgb", None) else None,
+                            }
+
+                        element["isBullet"] = any(
+                            paragraph.level is not None and paragraph.level > 0
+                            for paragraph in text_frame.paragraphs
+                        )
+
+                        
+                elif shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
+                    element["type"] = "image"
+
+                elements.append(element)
+
+            slides_data.append({"index": index, "elements": elements})
 
     raw = {
         "slideSize": {

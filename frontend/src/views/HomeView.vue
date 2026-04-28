@@ -154,7 +154,7 @@
           <AcIcon name="plus" :size="13" /> Новый шаблон
         </button>
         <button class="tb-btn" @click="$refs.pptxInput.click()" :disabled="pptxImporting">
-          <AcIcon name="upload" :size="13" /> {{ pptxImporting ? 'Импорт...' : 'Загрузить PPTX' }}
+          <AcIcon :name="pptxImporting ? 'spinner' : 'upload'" :size="13" /> {{ pptxImporting ? 'Импорт...' : 'Загрузить PPTX' }}
         </button>
         <input ref="pptxInput" type="file" accept=".pptx" style="display: none" @change="importPptx" />
       </div>

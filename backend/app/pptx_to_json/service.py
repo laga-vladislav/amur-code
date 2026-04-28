@@ -38,6 +38,9 @@ def convert_pptx_to_template(source: str | UploadFile | bytes | bytearray) -> Te
     except AiApiError:
         template_data = _generate_template_fallback(raw_data)
 
+    # If AI returned invalid template (missing required fields), use fallback
+    if not template_data.get("documentType"):
+        template_data = _generate_template_fallback(raw_data)
 
     return TemplateDocument.model_validate(template_data)
 
