@@ -1,17 +1,32 @@
-"""AI generation orchestration for outlines, decks, and generated assets."""
+"""AI generation orchestration for outlines, decks, and generated assets.
+
+Architectural notes
+-------------------
+* Outline → approved outline → presentation build is synchronous (LLM only).
+* Image generation is dispatched to background worker threads so the user
+  receives a usable presentation immediately and the heavy SD calls run after.
+* Job state lives in storage/image_jobs/<presentation_id>.json and is polled
+  by the frontend; once a job finishes the frontend pulls the asset and
+  patches the in-memory document.
+"""
 
 from __future__ import annotations
 
 import base64
 import json
+import logging
 import os
 import random
+import re
+import threading
 import time
 import uuid
 from typing import Any
 from urllib import error, parse, request
 
 from pydantic import ValidationError
+
+logger = logging.getLogger(__name__)
 
 from .ai_models import (
     GenerationBasis,
@@ -38,9 +53,13 @@ from .models import (
     ThemeFonts,
 )
 from .storage import (
+    delete_image_jobs,
     get_generation,
+    get_image_jobs,
+    get_presentation,
     get_template,
     save_generation,
+    save_image_jobs,
     save_presentation,
     store_asset,
 )
@@ -102,6 +121,166 @@ STYLE_THEMES: dict[str, PresentationTheme] = {
 }
 
 
+STYLE_VISUAL_LANGUAGE: dict[str, str] = {
+    "business": (
+        "editorial photography or polished 3D render, dark navy / charcoal palette "
+        "with warm amber and electric blue accents, premium B2B feel, soft cinematic lighting"
+    ),
+    "friendly": (
+        "warm natural-light photography or hand-drawn flat illustration, "
+        "cream/beige background, vivid orange and emerald accents, optimistic and approachable mood"
+    ),
+    "academic": (
+        "clean minimalist photography or precise vector illustration, "
+        "white/cool-grey palette with cobalt blue and teal accents, intellectual and rigorous tone"
+    ),
+    "promo": (
+        "high-energy editorial photography or vibrant 3D scene, "
+        "deep black background with neon coral, gold and electric blue, bold cinematic mood"
+    ),
+}
+
+
+# ---------------------------------------------------------------------------
+# LLM prompt construction
+# ---------------------------------------------------------------------------
+
+OUTLINE_SYSTEM_PROMPT = (
+    "Ты — старший продюсер презентаций и сценарист, работающий с топ-менеджерами, "
+    "стартапами и преподавателями. Ты пишешь конкретно, по делу и без штампов.\n\n"
+    "ЖЁСТКИЕ ПРАВИЛА:\n"
+    "1. Заголовки слайдов — это ТЕЗИСЫ, а не рубрики. Запрещены: «Введение», «Раздел 1..N», "
+    "«Основная часть», «Тезис 1», «Контекст», «Главное», «Ключевой образ», «Выводы», "
+    "«Заключение», «Спасибо за внимание», «Обзор», «О нас», «Цели», «Подход».\n"
+    "2. Каждый заголовок — формулировка, у которой видна позиция автора. Пример «плохо»: "
+    "«Финансовые показатели». Пример «хорошо»: «Выручка выросла на 38% за счёт enterprise — "
+    "и это меняет приоритеты команды».\n"
+    "3. keyPoints — короткие, осмысленные тезисы (5–14 слов), желательно с цифрами, фактами "
+    "или конкретными решениями. Никаких «Тезис 1 / Тезис 2».\n"
+    "4. Каждый слайд должен раскрывать что-то новое. Не повторяй мысль из предыдущего слайда.\n"
+    "5. Используй живой деловой русский язык, без канцелярита и общих мест.\n"
+    "6. visualIntent — короткое описание визуала на русском (что должно быть на слайде, "
+    "какая метафора). imagePrompt — детальный prompt для Stable Diffusion на АНГЛИЙСКОМ, "
+    "конкретный, с указанием стиля, света, композиции и цветовой палитры. Запрещены слова "
+    "text, words, letters, logo, watermark, caption — внутри картинки текста быть не должно.\n"
+    "7. needsImage = true только если визуал реально усиливает мысль слайда. Не делай картинки "
+    "ради картинок.\n\n"
+    "Возвращай строго валидный JSON-объект без Markdown, без комментариев и без текста вокруг."
+)
+
+CONTENT_SYSTEM_PROMPT = (
+    "Ты — редактор и сценарист презентаций. На вход получаешь утверждённое оглавление "
+    "(заголовки и тезисы) и должен превратить его в готовое содержимое слайдов.\n\n"
+    "ЖЁСТКИЕ ПРАВИЛА:\n"
+    "1. Сохрани порядок и количество слайдов. Заголовки можно слегка отредактировать, "
+    "если они шаблонны, но смысл не меняй.\n"
+    "2. keyPoints — это финальный текст, который окажется на слайде. Каждая строка — "
+    "цельная, законченная мысль (8–18 слов), без вводных «итак», «таким образом», «как мы видим». "
+    "Используй конкретику: цифры, имена продуктов, действия, сроки.\n"
+    "3. Запрещены штампы: «Тезис 1», «Раздел N», «Контекст», «Введение», «Заключение», "
+    "«Главный вывод», «Ключевой образ», «Поддерживающий тезис», «Решение или действие», "
+    "«Целевая аудитория из запроса», «Раскрыть часть темы».\n"
+    "4. purpose — одна сильная фраза о роли слайда в нарративе (зачем он нужен в этой логике). "
+    "Не пересказывай заголовок.\n"
+    "5. speakerNotes — 2–3 предложения, что докладчик может сказать вслух, расширяя тезисы.\n"
+    "6. visualIntent — на русском, что должно быть в кадре и почему. imagePrompt — на АНГЛИЙСКОМ, "
+    "детальный prompt для Stable Diffusion: субъект, окружение, стиль, освещение, цветовая "
+    "палитра под выбранный стиль презентации, композиция (rule of thirds, close-up, wide shot). "
+    "Никакого текста на изображении, без логотипов, без водяных знаков.\n"
+    "7. needsImage = true только если визуал реально работает на смысл слайда.\n\n"
+    "Возвращай строго валидный JSON-объект без Markdown."
+)
+
+IMAGE_PROMPT_SYSTEM = (
+    "You craft prompts for Stable Diffusion. Output ONE concise English prompt "
+    "(40-70 words) describing a single coherent scene. Include: subject, setting, "
+    "art style, lighting, color palette, composition, mood. Add quality boosters "
+    "like 'editorial photography', 'cinematic lighting', 'high detail'. "
+    "Strict negatives: no text, no letters, no captions, no logos, no watermarks, "
+    "no UI elements, no charts. Reply with just the prompt as plain text, no JSON, "
+    "no quotes, no markdown."
+)
+
+
+def _outline_user_text(payload: dict[str, Any]) -> str:
+    style_hint = _style_hint(payload.get("basis"))
+    return (
+        "Сгенерируй оглавление презентации по входному JSON.\n"
+        f"Стиль и визуальный язык: {style_hint}.\n"
+        "Ответ — валидный JSON-объект без Markdown.\n\n"
+        "Формат ответа:\n"
+        "{\n"
+        '  "title": "string — заголовок презентации, цепляющий, без штампов",\n'
+        '  "audience": "string — кому это адресовано, конкретно (роль/сегмент)",\n'
+        '  "goal": "string — какое решение/действие должно состояться после просмотра",\n'
+        '  "slides": [\n'
+        "    {\n"
+        '      "order": 1,\n'
+        '      "title": "string — заголовок-тезис, не рубрика",\n'
+        '      "purpose": "string — зачем этот слайд в нарративе (одно предложение)",\n'
+        '      "keyPoints": ["string — короткий осмысленный тезис, 5-14 слов"],\n'
+        '      "visualIntent": "string — описание визуала на русском",\n'
+        '      "needsImage": false,\n'
+        '      "slideType": "title|text|image|bullets|conclusion",\n'
+        '      "imagePrompt": "string — детальный английский prompt для Stable Diffusion",\n'
+        '      "speakerNotes": "string — что сказать вслух (1-2 предложения)"\n'
+        "    }\n"
+        "  ]\n"
+        "}\n\n"
+        "Входной JSON:\n"
+        f"{json.dumps(payload, ensure_ascii=False)}"
+    )
+
+
+def _content_user_text(payload: dict[str, Any]) -> str:
+    style_hint = _style_hint(payload.get("basis"))
+    return (
+        "Преврати утверждённое оглавление в финальное содержимое слайдов. Это контент, "
+        "который окажется на экране, поэтому формулировки должны быть готовы к показу.\n"
+        f"Визуальный язык: {style_hint}.\n"
+        "Ответ — валидный JSON-объект без Markdown, та же структура, что на входе.\n\n"
+        "Каждый слайд:\n"
+        "- title: финальный заголовок (можно слегка переписать, если он шаблонный)\n"
+        "- purpose: 1 предложение, роль слайда в логике\n"
+        "- keyPoints: МАССИВ строк. Каждая строка — самостоятельный тезис из 8-18 слов с "
+        "конкретикой (цифры/имена/действия). Без вводных слов и без перечислений типа «Тезис N».\n"
+        "- needsImage: bool, true только если визуал реально нужен\n"
+        "- visualIntent: на русском\n"
+        "- imagePrompt: на АНГЛИЙСКОМ, детально (subject, scene, style, lighting, palette)\n"
+        "- speakerNotes: 1-3 предложения для докладчика\n\n"
+        "Входной JSON:\n"
+        f"{json.dumps(payload, ensure_ascii=False)}"
+    )
+
+
+def _retry_user_text(payload: dict[str, Any]) -> str:
+    style_hint = _style_hint(payload.get("basis"))
+    return (
+        "Перепиши оглавление, учитывая обратную связь пользователя. Не повторяй прошлую структуру "
+        "буквально — переосмысли её там, где этого требует фидбек, остальное сохрани.\n"
+        f"Визуальный язык: {style_hint}.\n"
+        "Ответ — JSON в той же форме, что и обычная генерация оглавления.\n\n"
+        f"Фидбек: {payload.get('feedback')}\n\n"
+        "Контекст:\n"
+        f"{json.dumps(payload, ensure_ascii=False)}"
+    )
+
+
+def _style_hint(basis: Any) -> str:
+    if not isinstance(basis, dict):
+        return STYLE_VISUAL_LANGUAGE["business"]
+    kind = basis.get("kind")
+    if kind == "style":
+        style_id = basis.get("styleId") or "business"
+        return STYLE_VISUAL_LANGUAGE.get(style_id, STYLE_VISUAL_LANGUAGE["business"])
+    return STYLE_VISUAL_LANGUAGE["business"]
+
+
+# ---------------------------------------------------------------------------
+# Public orchestration
+# ---------------------------------------------------------------------------
+
+
 def create_outline(payload: OutlineGenerationRequest) -> OutlineGenerationResponse:
     _validate_basis(payload.basis)
     outline = _mock_outline(payload) if _mock_enabled() else _generate_outline(payload)
@@ -136,9 +315,13 @@ def retry_outline(generation_id: str, payload: OutlineRetryRequest) -> OutlineGe
             "basis": source_request.basis.model_dump(mode="json"),
             "previousOutline": payload.outline.model_dump(mode="json"),
             "feedback": payload.feedback,
-            "requiredJsonSchema": _outline_schema_hint(),
         }
-        raw = _call_qwen_json(llm_payload, max_new_tokens=1536)
+        raw = _call_qwen_json(
+            user_text=_retry_user_text(llm_payload),
+            system_prompt=OUTLINE_SYSTEM_PROMPT,
+            max_new_tokens=2200,
+            temperature=0.85,
+        )
         outline = _normalize_outline(raw, source_request)
 
     record["status"] = "outline_ready"
@@ -152,7 +335,7 @@ def build_presentation(
     generation_id: str, payload: PresentationBuildRequest
 ) -> PresentationDocument:
     record = _load_record(generation_id)
-    if record.get("status") != "outline_ready":
+    if record.get("status") not in {"outline_ready", "presentation_ready"}:
         raise AiApiError(409, "Generation is not ready for presentation build")
 
     source_request = OutlineGenerationRequest.model_validate(record["request"])
@@ -170,6 +353,9 @@ def build_presentation(
     doc = _build_document(source_request.basis, content_outline, payload.imagePolicy)
     saved = save_presentation(doc)
 
+    if payload.imagePolicy.generateImages:
+        _enqueue_image_jobs(saved, content_outline, payload.imagePolicy.imageType)
+
     record["status"] = "presentation_ready"
     record["approvedOutline"] = outline.model_dump(mode="json")
     record["contentOutline"] = content_outline.model_dump(mode="json")
@@ -179,6 +365,169 @@ def build_presentation(
     return saved
 
 
+# ---------------------------------------------------------------------------
+# Single-slide and single-image regeneration
+# ---------------------------------------------------------------------------
+
+
+def regenerate_slide_content(
+    presentation_id: str,
+    slide_id: str,
+    instructions: str | None,
+) -> PresentationDocument:
+    """Re-runs the LLM for a single slide, keeping the rest of the deck intact."""
+    doc = get_presentation(presentation_id)
+    if not doc:
+        raise AiApiError(404, "Presentation not found")
+    slide_index = next(
+        (i for i, s in enumerate(doc.slides) if s.id == slide_id), -1
+    )
+    if slide_index < 0:
+        raise AiApiError(404, "Slide not found")
+
+    generation_meta = (doc.meta or {}).get("generation") or {}
+    outline_data = generation_meta.get("outline") or _outline_from_document(doc)
+    outline = PresentationOutline.model_validate(outline_data)
+    basis_dict = generation_meta.get("basis") or _default_basis_dict()
+    style_hint = _style_hint(basis_dict)
+
+    target_outline = next(
+        (s for s in outline.slides if s.order == slide_index + 1),
+        None,
+    ) or _outline_slide_from_doc_slide(doc.slides[slide_index], slide_index + 1)
+
+    if _mock_enabled():
+        new_slide_outline = target_outline.model_copy(
+            update={
+                "title": f"{target_outline.title} (rev {random.randint(2, 9)})",
+                "keyPoints": [
+                    f"Уточнено: {instructions[:80]}" if instructions else "Уточнённый тезис"
+                ] + (target_outline.keyPoints or []),
+            }
+        )
+    else:
+        llm_payload = {
+            "task": "regenerate_single_slide",
+            "presentationTitle": outline.title,
+            "audience": outline.audience,
+            "goal": outline.goal,
+            "slideIndex": slide_index + 1,
+            "totalSlides": len(doc.slides),
+            "currentSlide": target_outline.model_dump(mode="json"),
+            "instructions": instructions or "Перепиши слайд так, чтобы формулировки стали "
+            "конкретнее, добавь цифры/факты, убери штампы и канцелярит.",
+            "neighbours": [
+                doc.slides[idx].name or f"Слайд {idx + 1}"
+                for idx in (slide_index - 1, slide_index + 1)
+                if 0 <= idx < len(doc.slides)
+            ],
+            "styleHint": style_hint,
+        }
+        user_text = (
+            "Перепиши ОДИН слайд презентации. Сохрани его роль в нарративе, но улучши "
+            "формулировки и сделай конкретнее. Ответ — JSON-объект ровно с теми же ключами, "
+            "что у currentSlide. Не возвращай массив и не возвращай весь outline.\n\n"
+            f"Контекст:\n{json.dumps(llm_payload, ensure_ascii=False)}"
+        )
+        raw = _call_qwen_json(
+            user_text=user_text,
+            system_prompt=CONTENT_SYSTEM_PROMPT,
+            max_new_tokens=900,
+            temperature=0.9,
+        )
+        new_slide_outline = _normalize_single_slide(raw, target_outline, slide_index + 1)
+
+    if not new_slide_outline.imagePrompt and (
+        new_slide_outline.needsImage or new_slide_outline.slideType == "image"
+    ):
+        new_slide_outline = new_slide_outline.model_copy(
+            update={
+                "imagePrompt": _craft_image_prompt(
+                    outline.title,
+                    new_slide_outline,
+                    style_hint,
+                )
+            }
+        )
+
+    _replace_slide_in_document(doc, slide_index, new_slide_outline, outline)
+    saved = save_presentation(doc)
+
+    if new_slide_outline.needsImage or new_slide_outline.slideType == "image":
+        image_type = (
+            (generation_meta.get("imagePolicy") or {}).get("imageType") or "png"
+        )
+        _enqueue_image_jobs_for_slide(saved, slide_index, new_slide_outline, image_type)
+
+    return saved
+
+
+def regenerate_slide_image(
+    presentation_id: str,
+    slide_id: str,
+    prompt_override: str | None,
+    image_type: str | None = None,
+) -> dict[str, Any]:
+    """Schedules a fresh image-generation job for the given slide."""
+    doc = get_presentation(presentation_id)
+    if not doc:
+        raise AiApiError(404, "Presentation not found")
+    slide_index = next(
+        (i for i, s in enumerate(doc.slides) if s.id == slide_id), -1
+    )
+    if slide_index < 0:
+        raise AiApiError(404, "Slide not found")
+    slide = doc.slides[slide_index]
+    image_element = next((el for el in slide.elements if el.type == "image"), None)
+    if not image_element:
+        raise AiApiError(422, "Slide has no image element to regenerate")
+
+    generation_meta = (doc.meta or {}).get("generation") or {}
+    style_hint = _style_hint(generation_meta.get("basis"))
+    outline_data = generation_meta.get("outline") or _outline_from_document(doc)
+    outline = PresentationOutline.model_validate(outline_data)
+    target_outline = next(
+        (s for s in outline.slides if s.order == slide_index + 1),
+        None,
+    ) or _outline_slide_from_doc_slide(slide, slide_index + 1)
+
+    final_prompt = (prompt_override or "").strip()
+    if not final_prompt:
+        final_prompt = _craft_image_prompt(outline.title, target_outline, style_hint)
+
+    job_image_type = (
+        image_type
+        or (generation_meta.get("imagePolicy") or {}).get("imageType")
+        or "png"
+    )
+
+    job = _create_or_replace_job(
+        presentation_id=presentation_id,
+        slide_id=slide.id,
+        element_id=image_element.id,
+        prompt=final_prompt,
+        image_type=job_image_type,
+    )
+    _start_worker(presentation_id, job["id"])
+    return job
+
+
+def get_image_jobs_status(presentation_id: str) -> dict[str, Any]:
+    state = get_image_jobs(presentation_id) or {
+        "presentationId": presentation_id,
+        "jobs": {},
+    }
+    return {
+        "presentationId": presentation_id,
+        "jobs": list(state.get("jobs", {}).values()),
+    }
+
+
+# ---------------------------------------------------------------------------
+# LLM call
+# ---------------------------------------------------------------------------
+
+
 def _generate_outline(payload: OutlineGenerationRequest) -> PresentationOutline:
     llm_payload = {
         "task": "presentation_outline",
@@ -186,9 +535,13 @@ def _generate_outline(payload: OutlineGenerationRequest) -> PresentationOutline:
         "slideCount": payload.slideCount,
         "language": payload.language,
         "basis": payload.basis.model_dump(mode="json"),
-        "requiredJsonSchema": _outline_schema_hint(),
     }
-    raw = _call_qwen_json(llm_payload, max_new_tokens=1536)
+    raw = _call_qwen_json(
+        user_text=_outline_user_text(llm_payload),
+        system_prompt=OUTLINE_SYSTEM_PROMPT,
+        max_new_tokens=2400,
+        temperature=0.85,
+    )
     return _normalize_outline(raw, payload)
 
 
@@ -200,21 +553,79 @@ def _generate_slide_content(
         "prompt": source_request.prompt,
         "outline": outline.model_dump(mode="json"),
         "basis": source_request.basis.model_dump(mode="json"),
-        "requiredJsonSchema": _outline_schema_hint(include_content=True),
     }
-    raw = _call_qwen_json(llm_payload, max_new_tokens=4096)
+    raw = _call_qwen_json(
+        user_text=_content_user_text(llm_payload),
+        system_prompt=CONTENT_SYSTEM_PROMPT,
+        max_new_tokens=4500,
+        temperature=0.8,
+    )
     return _normalize_outline(raw, source_request, fallback_outline=outline)
 
 
-def _call_qwen_json(payload: dict[str, Any], max_new_tokens: int) -> dict[str, Any]:
+def _call_qwen_json(
+    *,
+    user_text: str,
+    system_prompt: str,
+    max_new_tokens: int,
+    temperature: float = 0.7,
+    top_p: float = 0.95,
+    top_k: int = 60,
+) -> dict[str, Any]:
+    last_text = ""
+    last_error: AiApiError | None = None
+    # Qwen is non-deterministic and occasionally returns prose around the JSON
+    # or truncates mid-object. Retry once with more headroom and a cooler
+    # temperature before surfacing 502 to the user.
+    attempts = (
+        (max_new_tokens, temperature),
+        (max(max_new_tokens, int(max_new_tokens * 1.4) + 200), max(0.3, temperature - 0.2)),
+    )
+    for attempt_index, (tokens, temp) in enumerate(attempts):
+        text = _call_qwen_text(
+            user_text=user_text,
+            system_prompt=system_prompt,
+            max_new_tokens=tokens,
+            temperature=temp,
+            top_p=top_p,
+            top_k=top_k,
+        )
+        last_text = text
+        try:
+            return _extract_json(text)
+        except AiApiError as exc:
+            last_error = exc
+            logger.warning(
+                "Qwen JSON parse failed on attempt %d/%d: %s; response head: %s",
+                attempt_index + 1,
+                len(attempts),
+                exc.detail,
+                text[:500].replace("\n", " "),
+            )
+    logger.error(
+        "Qwen JSON parse failed after %d attempts; full response: %s",
+        len(attempts),
+        last_text,
+    )
+    raise last_error or AiApiError(502, "Qwen response is not valid JSON")
+
+
+def _call_qwen_text(
+    *,
+    user_text: str,
+    system_prompt: str,
+    max_new_tokens: int,
+    temperature: float = 0.7,
+    top_p: float = 0.95,
+    top_k: int = 60,
+) -> str:
     token = os.getenv("RT_AI_TOKEN")
     if not token:
         raise AiApiError(401, "RT_AI_TOKEN is not configured")
 
     base_url = os.getenv("RT_AI_BASE_URL", "https://ai.rt.ru/api/1.0").rstrip("/")
     model = os.getenv("RT_AI_LLM_MODEL", "Qwen/Qwen2.5-72B-Instruct")
-    timeout = float(os.getenv("RT_AI_TIMEOUT_SECONDS", "90"))
-    user_text = _qwen_user_text(payload)
+    timeout = float(os.getenv("RT_AI_TIMEOUT_SECONDS", "120"))
     body = {
         "uuid": str(uuid.uuid4()),
         "chat": {
@@ -223,16 +634,13 @@ def _call_qwen_json(payload: dict[str, Any], max_new_tokens: int) -> dict[str, A
             "contents": [{"type": "text", "text": user_text}],
             "message_template": "<s>{role}\n{content}</s>",
             "response_template": "<s>bot\n",
-            "system_prompt": (
-                "Ты проектируешь презентации. Возвращай строго валидный JSON "
-                "без Markdown и без пояснений."
-            ),
+            "system_prompt": system_prompt,
             "max_new_tokens": max_new_tokens,
-            "no_repeat_ngram_size": 15,
-            "repetition_penalty": 1.1,
-            "temperature": 0.2,
-            "top_k": 40,
-            "top_p": 0.9,
+            "no_repeat_ngram_size": 5,
+            "repetition_penalty": 1.18,
+            "temperature": temperature,
+            "top_k": top_k,
+            "top_p": top_p,
             "chat_history": [],
         },
     }
@@ -244,39 +652,9 @@ def _call_qwen_json(payload: dict[str, Any], max_new_tokens: int) -> dict[str, A
         timeout,
     )
     try:
-        content = data[0]["message"]["content"]
+        return data[0]["message"]["content"]
     except (KeyError, IndexError, TypeError) as exc:
         raise AiApiError(502, "Qwen response does not contain message.content") from exc
-    return _extract_json(content)
-
-
-def _qwen_user_text(payload: dict[str, Any]) -> str:
-    return (
-        "Сгенерируй данные для презентации по входному JSON.\n"
-        "Ответ должен быть только валидным JSON-объектом без Markdown, без комментариев "
-        "и без текста вокруг JSON.\n"
-        "Формат ответа:\n"
-        "{\n"
-        '  "title": "string",\n'
-        '  "audience": "string",\n'
-        '  "goal": "string",\n'
-        '  "slides": [\n'
-        "    {\n"
-        '      "order": 1,\n'
-        '      "title": "string",\n'
-        '      "purpose": "string",\n'
-        '      "keyPoints": ["string"],\n'
-        '      "visualIntent": "string",\n'
-        '      "needsImage": false,\n'
-        '      "slideType": "title|text|image|bullets|conclusion",\n'
-        '      "imagePrompt": "string",\n'
-        '      "speakerNotes": "string"\n'
-        "    }\n"
-        "  ]\n"
-        "}\n"
-        "Входной JSON:\n"
-        f"{json.dumps(payload, ensure_ascii=False)}"
-    )
 
 
 def _request_json(
@@ -318,40 +696,130 @@ def _read_http_error(exc: error.HTTPError) -> str:
 
 
 def _extract_json(text: str) -> dict[str, Any]:
-    try:
-        parsed = json.loads(text)
-        if isinstance(parsed, dict):
-            return parsed
-    except json.JSONDecodeError:
-        pass
+    candidates: list[str] = []
+
+    def _push(s: str) -> None:
+        s = s.strip()
+        if s and s not in candidates:
+            candidates.append(s)
+
+    _push(text)
 
     cleaned = text.strip()
     if cleaned.startswith("```"):
-        cleaned = cleaned.strip("`")
-        if cleaned.lower().startswith("json"):
-            cleaned = cleaned[4:].strip()
-        try:
-            parsed = json.loads(cleaned)
-            if isinstance(parsed, dict):
-                return parsed
-        except json.JSONDecodeError:
-            pass
+        stripped = cleaned.strip("`")
+        if stripped.lower().startswith("json"):
+            stripped = stripped[4:]
+        _push(stripped)
 
-    for start, end in (("{", "}"), ("[", "]")):
-        first = text.find(start)
-        last = text.rfind(end)
-        if first >= 0 and last > first:
-            fragment = text[first : last + 1]
+    fence_match = re.search(r"```(?:json)?\s*(.+?)```", text, re.DOTALL | re.IGNORECASE)
+    if fence_match:
+        _push(fence_match.group(1))
+
+    _push(_balanced_fragment(text, "{", "}"))
+    _push(_balanced_fragment(text, "[", "]"))
+
+    naive_obj_first = text.find("{")
+    naive_obj_last = text.rfind("}")
+    if naive_obj_first >= 0 and naive_obj_last > naive_obj_first:
+        _push(text[naive_obj_first : naive_obj_last + 1])
+    naive_arr_first = text.find("[")
+    naive_arr_last = text.rfind("]")
+    if naive_arr_first >= 0 and naive_arr_last > naive_arr_first:
+        _push(text[naive_arr_first : naive_arr_last + 1])
+
+    for raw in candidates:
+        for variant in (raw, _strip_trailing_commas(raw), _repair_truncated(raw)):
+            if not variant:
+                continue
             try:
-                parsed = json.loads(fragment)
+                parsed = json.loads(variant)
             except json.JSONDecodeError:
                 continue
-            if isinstance(parsed, list):
-                return {"slides": parsed}
             if isinstance(parsed, dict):
                 return parsed
+            if isinstance(parsed, list):
+                return {"slides": parsed}
 
     raise AiApiError(502, "Qwen response is not valid JSON")
+
+
+def _balanced_fragment(text: str, open_ch: str, close_ch: str) -> str:
+    """Returns the substring spanning a balanced open/close pair, ignoring brackets inside strings."""
+    start = text.find(open_ch)
+    if start < 0:
+        return ""
+    depth = 0
+    in_string = False
+    escape = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == open_ch:
+            depth += 1
+        elif ch == close_ch:
+            depth -= 1
+            if depth == 0:
+                return text[start : i + 1]
+    return ""
+
+
+def _strip_trailing_commas(text: str) -> str:
+    return re.sub(r",(\s*[}\]])", r"\1", text)
+
+
+def _repair_truncated(text: str) -> str:
+    """Closes unbalanced braces/brackets so a truncated Qwen response can still parse."""
+    if not text:
+        return ""
+    in_string = False
+    escape = False
+    stack: list[str] = []
+    last_complete = -1
+    for i, ch in enumerate(text):
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch in "{[":
+            stack.append("}" if ch == "{" else "]")
+        elif ch in "}]":
+            if stack and stack[-1] == ch:
+                stack.pop()
+                if not stack:
+                    last_complete = i
+    if not stack:
+        return text
+    head = text[: last_complete + 1] if last_complete >= 0 else text
+    if last_complete >= 0:
+        return head
+    repaired = text
+    if in_string:
+        repaired += '"'
+    repaired = _strip_trailing_commas(repaired)
+    repaired = re.sub(r"[,\s]+$", "", repaired)
+    repaired += "".join(reversed(stack))
+    return repaired
+
+
+# ---------------------------------------------------------------------------
+# Outline normalization
+# ---------------------------------------------------------------------------
 
 
 def _normalize_outline(
@@ -380,46 +848,8 @@ def _normalize_outline(
         if not isinstance(item, dict):
             item = {"title": str(item)}
         fallback_slide = previous.get(idx)
-        key_points = _coerce_str_list(
-            item.get("keyPoints")
-            or item.get("points")
-            or item.get("bullets")
-            or item.get(" тезисы")
-            or (fallback_slide.keyPoints if fallback_slide else [])
-        )
-        slide_type = item.get("slideType") or (fallback_slide.slideType if fallback_slide else None)
-        if slide_type not in ALLOWED_SLIDE_TYPES:
-            slide_type = None
-        visual_intent = (
-            item.get("visualIntent")
-            or item.get("visual")
-            or item.get("imageDescription")
-            or (fallback_slide.visualIntent if fallback_slide else None)
-        )
-        image_prompt = (
-            item.get("imagePrompt")
-            or item.get("visualPrompt")
-            or visual_intent
-            or (fallback_slide.imagePrompt if fallback_slide else None)
-        )
-        needs_image = bool(
-            item.get("needsImage")
-            or item.get("needImage")
-            or slide_type == "image"
-            or (fallback_slide.needsImage if fallback_slide else False)
-        )
         slides.append(
-            OutlineSlide(
-                order=int(item.get("order") or idx),
-                title=str(item.get("title") or (fallback_slide.title if fallback_slide else f"Слайд {idx}")),
-                purpose=str(item.get("purpose") or (fallback_slide.purpose if fallback_slide else "")),
-                keyPoints=key_points,
-                visualIntent=str(visual_intent) if visual_intent else None,
-                needsImage=needs_image,
-                slideType=slide_type,
-                imagePrompt=str(image_prompt) if image_prompt else None,
-                speakerNotes=item.get("speakerNotes") or item.get("notes"),
-            )
+            _coerce_slide(item, idx, fallback_slide)
         )
 
     return PresentationOutline(
@@ -430,27 +860,79 @@ def _normalize_outline(
     )
 
 
+def _normalize_single_slide(
+    raw: dict[str, Any],
+    fallback: OutlineSlide,
+    expected_order: int,
+) -> OutlineSlide:
+    if isinstance(raw, dict) and isinstance(raw.get("slide"), dict):
+        raw = raw["slide"]
+    if isinstance(raw, dict) and isinstance(raw.get("slides"), list) and raw["slides"]:
+        raw = raw["slides"][0]
+    if not isinstance(raw, dict):
+        raise AiApiError(502, "Slide regeneration response must be an object")
+    return _coerce_slide(raw, expected_order, fallback)
+
+
+def _coerce_slide(
+    item: dict[str, Any],
+    idx: int,
+    fallback: OutlineSlide | None,
+) -> OutlineSlide:
+    key_points = _coerce_str_list(
+        item.get("keyPoints")
+        or item.get("points")
+        or item.get("bullets")
+        or (fallback.keyPoints if fallback else [])
+    )
+    slide_type = item.get("slideType") or (fallback.slideType if fallback else None)
+    if slide_type not in ALLOWED_SLIDE_TYPES:
+        slide_type = None
+    visual_intent = (
+        item.get("visualIntent")
+        or item.get("visual")
+        or item.get("imageDescription")
+        or (fallback.visualIntent if fallback else None)
+    )
+    image_prompt = (
+        item.get("imagePrompt")
+        or item.get("visualPrompt")
+        or (fallback.imagePrompt if fallback else None)
+    )
+    needs_image = bool(
+        item.get("needsImage")
+        or item.get("needImage")
+        or slide_type == "image"
+        or (fallback.needsImage if fallback else False)
+    )
+    return OutlineSlide(
+        order=int(item.get("order") or idx),
+        title=str(item.get("title") or (fallback.title if fallback else f"Слайд {idx}")),
+        purpose=str(item.get("purpose") or (fallback.purpose if fallback else "")),
+        keyPoints=key_points,
+        visualIntent=str(visual_intent) if visual_intent else None,
+        needsImage=needs_image,
+        slideType=slide_type,
+        imagePrompt=str(image_prompt) if image_prompt else None,
+        speakerNotes=item.get("speakerNotes") or item.get("notes") or (fallback.speakerNotes if fallback else None),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Document assembly
+# ---------------------------------------------------------------------------
+
+
 def _build_document(
     basis: GenerationBasis, outline: PresentationOutline, image_policy: ImagePolicy
 ) -> PresentationDocument:
-    assets_by_order: dict[int, Asset] = {}
-    if image_policy.generateImages:
-        for slide in outline.slides:
-            if slide.needsImage or slide.slideType == "image":
-                image_prompt = slide.imagePrompt or slide.visualIntent
-                if not image_prompt:
-                    image_prompt = f"{outline.title}. {slide.title}. {slide.purpose}"
-                assets_by_order[slide.order] = _generate_image_asset(
-                    image_prompt, image_policy.imageType
-                )
-
     if isinstance(basis, LayoutGenerationBasis):
         template = get_template(basis.templateId)
         if not template:
             raise AiApiError(422, f"Template not found: {basis.templateId}")
-        doc = _build_layout_document(template, basis, outline, assets_by_order)
+        doc = _build_layout_document(template, basis, outline)
     elif isinstance(basis, StyleGenerationBasis):
-        doc = _build_style_document(basis, outline, assets_by_order)
+        doc = _build_style_document(basis, outline)
     else:
         raise AiApiError(422, "Unsupported generation basis")
 
@@ -469,7 +951,6 @@ def _build_layout_document(
     template: TemplateDocument,
     basis: LayoutGenerationBasis,
     outline: PresentationOutline,
-    assets_by_order: dict[int, Asset],
 ) -> PresentationDocument:
     doc = PresentationDocument(
         schemaVersion="1.0.0",
@@ -482,12 +963,9 @@ def _build_layout_document(
         slides=[],
         assets=[a.model_copy(deep=True) for a in template.assets],
     )
-    doc.assets.extend(assets_by_order.values())
     for idx, slide_outline in enumerate(outline.slides):
         layout = _pick_layout(template, basis, slide_outline, idx, len(outline.slides))
-        doc.slides.append(
-            _slide_from_layout(layout, slide_outline, outline, assets_by_order.get(slide_outline.order))
-        )
+        doc.slides.append(_slide_from_layout(layout, slide_outline, outline))
     return doc
 
 
@@ -529,7 +1007,6 @@ def _slide_from_layout(
     layout: LayoutDocument,
     slide_outline: OutlineSlide,
     outline: PresentationOutline,
-    asset: Asset | None,
 ) -> SlideDocument:
     elements: list[dict[str, Any]] = []
     for element in layout.elements:
@@ -548,16 +1025,24 @@ def _slide_from_layout(
         if payload["type"] == "text":
             payload["text"] = _text_for_role(fill_role, slide_outline, outline)
         elif payload["type"] == "image":
-            if asset:
-                payload["assetId"] = asset.id
-                payload["generation"] = {
-                    "prompt": slide_outline.imagePrompt
-                    or slide_outline.visualIntent
-                    or slide_outline.title,
-                    "model": "stable-diffusion",
-                }
-            else:
-                payload["placeholder"] = slide_outline.visualIntent or "Изображение"
+            payload["assetId"] = None
+            prompt = (
+                slide_outline.imagePrompt
+                or slide_outline.visualIntent
+                or slide_outline.title
+            )
+            payload["placeholder"] = slide_outline.visualIntent or "Картинка генерируется…"
+            payload["generation"] = {
+                "prompt": prompt,
+                "model": "stable-diffusion",
+            }
+            payload["meta"] = {
+                **(payload.get("meta") or {}),
+                "imageGeneration": {
+                    "status": "pending",
+                    "prompt": prompt,
+                },
+            }
         elements.append(payload)
 
     return SlideDocument.model_validate(
@@ -577,7 +1062,6 @@ def _slide_from_layout(
 def _build_style_document(
     basis: StyleGenerationBasis,
     outline: PresentationOutline,
-    assets_by_order: dict[int, Asset],
 ) -> PresentationDocument:
     theme = STYLE_THEMES[basis.styleId].model_copy(deep=True)
     doc = PresentationDocument(
@@ -588,12 +1072,10 @@ def _build_style_document(
         slideSize=SlideSize(widthEmu=12192000, heightEmu=6858000, ratio="16:9"),
         theme=theme,
         slides=[],
-        assets=list(assets_by_order.values()),
+        assets=[],
     )
     for idx, slide_outline in enumerate(outline.slides):
-        doc.slides.append(
-            _style_slide(slide_outline, outline, theme, assets_by_order.get(slide_outline.order), idx)
-        )
+        doc.slides.append(_style_slide(slide_outline, outline, theme, idx))
     return doc
 
 
@@ -601,11 +1083,10 @@ def _style_slide(
     slide_outline: OutlineSlide,
     outline: PresentationOutline,
     theme: PresentationTheme,
-    asset: Asset | None,
     idx: int,
 ) -> SlideDocument:
     is_title = idx == 0 or slide_outline.slideType == "title"
-    is_image = bool(asset)
+    is_image = slide_outline.needsImage or slide_outline.slideType == "image"
     background = BackgroundColor(type="color", value=theme.colors.background)
     elements: list[dict[str, Any]] = []
 
@@ -614,13 +1095,8 @@ def _style_slide(
             _text_element(
                 "title",
                 outline.title,
-                914400,
-                2200000,
-                10363200,
-                1200000,
-                56,
-                700,
-                theme.colors.text,
+                914400, 2200000, 10363200, 1200000,
+                56, 700, theme.colors.text,
             )
         )
         subtitle = slide_outline.purpose or outline.goal or outline.audience or ""
@@ -629,13 +1105,8 @@ def _style_slide(
                 _text_element(
                     "subtitle",
                     subtitle,
-                    914400,
-                    3600000,
-                    10363200,
-                    800000,
-                    28,
-                    400,
-                    theme.colors.secondary,
+                    914400, 3600000, 10363200, 800000,
+                    28, 400, theme.colors.secondary,
                 )
             )
     else:
@@ -645,13 +1116,8 @@ def _style_slide(
             _text_element(
                 "title",
                 slide_outline.title,
-                914400,
-                700000,
-                title_w,
-                800000,
-                38,
-                700,
-                theme.colors.text,
+                914400, 700000, title_w, 800000,
+                38, 700, theme.colors.text,
             )
         )
         role = "bulletList" if slide_outline.keyPoints else "body"
@@ -659,24 +1125,15 @@ def _style_slide(
             _text_element(
                 role,
                 _text_for_role(role, slide_outline, outline),
-                914400,
-                1750000,
-                body_w,
-                4300000,
-                24,
-                400,
-                theme.colors.text,
+                914400, 1750000, body_w, 4300000,
+                24, 400, theme.colors.text,
             )
         )
-        if is_image and asset:
+        if is_image:
             elements.append(
-                _image_element(
-                    asset,
-                    6700000,
-                    1450000,
-                    4572000,
-                    4300000,
-                    slide_outline.imagePrompt or slide_outline.visualIntent or slide_outline.title,
+                _image_placeholder_element(
+                    slide_outline,
+                    6700000, 1450000, 4572000, 4300000,
                 )
             )
 
@@ -723,22 +1180,271 @@ def _text_element(
     }
 
 
-def _image_element(
-    asset: Asset, x: int, y: int, w: int, h: int, prompt: str
+def _image_placeholder_element(
+    slide: OutlineSlide,
+    x: int,
+    y: int,
+    w: int,
+    h: int,
 ) -> dict[str, Any]:
+    prompt = slide.imagePrompt or slide.visualIntent or slide.title
     return {
         "id": _new_id("el"),
         "type": "image",
         "role": "image",
         "contentBehavior": {"kind": "generated", "readonly": False, "fillRole": "image"},
-        "assetId": asset.id,
+        "assetId": None,
         "fit": "cover",
+        "placeholder": slide.visualIntent or "Картинка генерируется…",
         "frame": {"xEmu": x, "yEmu": y, "wEmu": w, "hEmu": h, "rotate": 0},
         "generation": {"prompt": prompt, "model": "stable-diffusion"},
+        "meta": {"imageGeneration": {"status": "pending", "prompt": prompt}},
         "zIndex": 9,
         "locked": False,
         "visible": True,
     }
+
+
+# ---------------------------------------------------------------------------
+# Image generation jobs
+# ---------------------------------------------------------------------------
+
+_JOB_LOCKS: dict[str, threading.Lock] = {}
+_JOB_LOCKS_GUARD = threading.Lock()
+
+
+def _lock_for(presentation_id: str) -> threading.Lock:
+    with _JOB_LOCKS_GUARD:
+        lock = _JOB_LOCKS.get(presentation_id)
+        if lock is None:
+            lock = threading.Lock()
+            _JOB_LOCKS[presentation_id] = lock
+        return lock
+
+
+def _empty_jobs_state(presentation_id: str) -> dict[str, Any]:
+    return {
+        "presentationId": presentation_id,
+        "createdAt": _now_ms(),
+        "updatedAt": _now_ms(),
+        "jobs": {},
+    }
+
+
+def _enqueue_image_jobs(
+    presentation: PresentationDocument,
+    outline: PresentationOutline,
+    image_type: str,
+) -> None:
+    pending: list[tuple[str, str, str]] = []
+    with _lock_for(presentation.id):
+        state = get_image_jobs(presentation.id) or _empty_jobs_state(presentation.id)
+        state["presentationId"] = presentation.id
+        outline_by_order = {s.order: s for s in outline.slides}
+        for slide_idx, slide in enumerate(presentation.slides):
+            slide_outline = outline_by_order.get(slide_idx + 1)
+            if not slide_outline:
+                continue
+            for el in slide.elements:
+                if el.type != "image":
+                    continue
+                meta = (el.meta or {}).get("imageGeneration") or {}
+                if meta.get("status") in {"ready", "in_progress"}:
+                    continue
+                prompt = meta.get("prompt") or slide_outline.imagePrompt or slide_outline.title
+                job = _build_job_record(
+                    slide.id, el.id, prompt, image_type
+                )
+                state["jobs"][job["id"]] = job
+                pending.append((presentation.id, job["id"], prompt))
+        state["updatedAt"] = _now_ms()
+        save_image_jobs(presentation.id, state)
+    for presentation_id, job_id, _prompt in pending:
+        _start_worker(presentation_id, job_id)
+
+
+def _enqueue_image_jobs_for_slide(
+    presentation: PresentationDocument,
+    slide_index: int,
+    slide_outline: OutlineSlide,
+    image_type: str,
+) -> None:
+    slide = presentation.slides[slide_index]
+    image_element = next((el for el in slide.elements if el.type == "image"), None)
+    if not image_element:
+        return
+    prompt = (
+        slide_outline.imagePrompt
+        or (image_element.meta or {}).get("imageGeneration", {}).get("prompt")
+        or slide_outline.title
+    )
+    _create_or_replace_job(
+        presentation_id=presentation.id,
+        slide_id=slide.id,
+        element_id=image_element.id,
+        prompt=prompt,
+        image_type=image_type,
+    )
+    job_id = _job_key(slide.id, image_element.id)
+    _start_worker(presentation.id, job_id)
+
+
+def _build_job_record(
+    slide_id: str, element_id: str, prompt: str, image_type: str
+) -> dict[str, Any]:
+    return {
+        "id": _job_key(slide_id, element_id),
+        "slideId": slide_id,
+        "elementId": element_id,
+        "prompt": prompt,
+        "imageType": image_type,
+        "status": "pending",
+        "assetId": None,
+        "url": None,
+        "error": None,
+        "version": 1,
+        "createdAt": _now_ms(),
+        "updatedAt": _now_ms(),
+    }
+
+
+def _create_or_replace_job(
+    *,
+    presentation_id: str,
+    slide_id: str,
+    element_id: str,
+    prompt: str,
+    image_type: str,
+) -> dict[str, Any]:
+    job_id = _job_key(slide_id, element_id)
+    with _lock_for(presentation_id):
+        state = get_image_jobs(presentation_id) or _empty_jobs_state(presentation_id)
+        existing = state["jobs"].get(job_id)
+        version = (existing.get("version") if existing else 0) + 1
+        job = _build_job_record(slide_id, element_id, prompt, image_type)
+        job["version"] = version
+        state["jobs"][job_id] = job
+        state["updatedAt"] = _now_ms()
+        save_image_jobs(presentation_id, state)
+        return dict(job)
+
+
+def _job_key(slide_id: str, element_id: str) -> str:
+    return f"{slide_id}::{element_id}"
+
+
+def _start_worker(presentation_id: str, job_id: str) -> None:
+    thread = threading.Thread(
+        target=_run_image_job,
+        args=(presentation_id, job_id),
+        daemon=True,
+        name=f"img-{presentation_id[:8]}-{job_id[:8]}",
+    )
+    thread.start()
+
+
+def _update_job(
+    presentation_id: str,
+    job_id: str,
+    expected_version: int,
+    patch: dict[str, Any],
+) -> bool:
+    with _lock_for(presentation_id):
+        state = get_image_jobs(presentation_id)
+        if not state:
+            return False
+        current = state["jobs"].get(job_id)
+        if not current or current.get("version") != expected_version:
+            return False
+        current.update(patch)
+        current["updatedAt"] = _now_ms()
+        state["updatedAt"] = _now_ms()
+        save_image_jobs(presentation_id, state)
+        return True
+
+
+def _run_image_job(presentation_id: str, job_id: str) -> None:
+    with _lock_for(presentation_id):
+        state = get_image_jobs(presentation_id)
+        if not state:
+            return
+        job = state["jobs"].get(job_id)
+        if not job:
+            return
+        version = job["version"]
+        prompt = job["prompt"]
+        image_type = job["imageType"]
+        job["status"] = "in_progress"
+        job["updatedAt"] = _now_ms()
+        save_image_jobs(presentation_id, state)
+
+    try:
+        asset = _generate_image_asset(prompt, image_type)
+    except AiApiError as exc:
+        _update_job(
+            presentation_id,
+            job_id,
+            version,
+            {"status": "failed", "error": str(exc.detail)},
+        )
+        return
+    except Exception as exc:  # pragma: no cover - defensive
+        _update_job(
+            presentation_id,
+            job_id,
+            version,
+            {"status": "failed", "error": str(exc)},
+        )
+        return
+
+    _attach_asset_to_presentation(presentation_id, asset)
+    _update_job(
+        presentation_id,
+        job_id,
+        version,
+        {
+            "status": "ready",
+            "assetId": asset.id,
+            "url": asset.url,
+            "asset": {
+                "id": asset.id,
+                "type": "image",
+                "mimeType": asset.mimeType,
+                "url": asset.url,
+                "fileName": asset.fileName,
+            },
+            "error": None,
+        },
+    )
+
+
+def _attach_asset_to_presentation(presentation_id: str, asset: Asset) -> None:
+    """Adds the new asset to the presentation document so it survives reloads.
+
+    The frontend is the source of truth for slide-element wiring; this only
+    ensures the asset is registered in `doc.assets` and visible via the static
+    file route.
+    """
+    with _lock_for(presentation_id):
+        doc = get_presentation(presentation_id)
+        if not doc:
+            return
+        if any(a.id == asset.id for a in doc.assets):
+            return
+        doc.assets.append(asset)
+        save_presentation(doc)
+
+
+# ---------------------------------------------------------------------------
+# SD image call (synchronous, runs on a worker thread)
+# ---------------------------------------------------------------------------
+
+
+YANDEX_ASPECTS = {"1:1", "16:9", "9:16", "3:2", "2:3", "4:7", "7:4"}
+
+
+def _image_provider() -> str:
+    return os.getenv("RT_AI_IMAGE_PROVIDER", "yandex").strip().lower() or "yandex"
 
 
 def _generate_image_asset(prompt: str, image_type: str) -> Asset:
@@ -747,18 +1453,68 @@ def _generate_image_asset(prompt: str, image_type: str) -> Asset:
         asset.meta = {"mock": True, "prompt": prompt}
         return asset
 
+    provider = _image_provider()
+    if provider == "sd":
+        return _generate_image_sd(prompt, image_type)
+    return _generate_image_yandex(prompt, image_type)
+
+
+def _generate_image_yandex(prompt: str, image_type: str) -> Asset:
     token = os.getenv("RT_AI_TOKEN")
     if not token:
         raise AiApiError(401, "RT_AI_TOKEN is not configured")
 
     base_url = os.getenv("RT_AI_BASE_URL", "https://ai.rt.ru/api/1.0").rstrip("/")
-    timeout = float(os.getenv("RT_AI_TIMEOUT_SECONDS", "90"))
+    timeout = float(os.getenv("RT_AI_TIMEOUT_SECONDS", "180"))
+    aspect = os.getenv("RT_AI_YANDEX_ASPECT", "16:9").strip()
+    if aspect not in YANDEX_ASPECTS:
+        aspect = "16:9"
+    body = {
+        "uuid": str(uuid.uuid4()),
+        "image": {
+            "request": prompt,
+            "seed": random.randint(1, 2147483647),
+            "translate": _looks_like_russian(prompt),
+            "model": os.getenv("RT_AI_YANDEX_MODEL", "yandex-art"),
+            "aspect": aspect,
+        },
+    }
+    response_payload = _request_json(
+        f"{base_url}/ya/image",
+        "POST",
+        token,
+        json.dumps(body, ensure_ascii=False).encode("utf-8"),
+        timeout,
+    )
+    try:
+        message_id = response_payload[0]["message"]["id"]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise AiApiError(502, "Yandex ART response does not contain message.id") from exc
+
+    file_bytes = _download_image(base_url, token, "yaArt", message_id, image_type, timeout)
+    mime_type = "image/jpeg" if image_type == "jpeg" else f"image/{image_type}"
+    asset = store_asset(file_bytes, f"generated_{message_id}.{image_type}", mime_type)
+    asset.meta = {
+        "prompt": prompt,
+        "externalMessageId": message_id,
+        "provider": "yandex-art",
+    }
+    return asset
+
+
+def _generate_image_sd(prompt: str, image_type: str) -> Asset:
+    token = os.getenv("RT_AI_TOKEN")
+    if not token:
+        raise AiApiError(401, "RT_AI_TOKEN is not configured")
+
+    base_url = os.getenv("RT_AI_BASE_URL", "https://ai.rt.ru/api/1.0").rstrip("/")
+    timeout = float(os.getenv("RT_AI_TIMEOUT_SECONDS", "180"))
     body = {
         "uuid": str(uuid.uuid4()),
         "sdImage": {
             "request": prompt,
             "seed": random.randint(1, 2147483647),
-            "translate": False,
+            "translate": _looks_like_russian(prompt),
         },
     }
     response_payload = _request_json(
@@ -773,12 +1529,30 @@ def _generate_image_asset(prompt: str, image_type: str) -> Asset:
     except (KeyError, IndexError, TypeError) as exc:
         raise AiApiError(502, "Stable Diffusion response does not contain message.id") from exc
 
+    file_bytes = _download_image(base_url, token, "sd", message_id, image_type, timeout)
+    mime_type = "image/jpeg" if image_type == "jpeg" else f"image/{image_type}"
+    asset = store_asset(file_bytes, f"generated_{message_id}.{image_type}", mime_type)
+    asset.meta = {
+        "prompt": prompt,
+        "externalMessageId": message_id,
+        "provider": "stable-diffusion",
+    }
+    return asset
+
+
+def _download_image(
+    base_url: str,
+    token: str,
+    service_type: str,
+    message_id: Any,
+    image_type: str,
+    timeout: float,
+) -> bytes:
     query = parse.urlencode(
-        {"id": message_id, "serviceType": "sd", "imageType": image_type}
+        {"id": message_id, "serviceType": service_type, "imageType": image_type}
     )
-    download_url = f"{base_url}/download?{query}"
     req = request.Request(
-        download_url,
+        f"{base_url}/download?{query}",
         method="GET",
         headers={
             "Authorization": f"Bearer {token}",
@@ -787,7 +1561,7 @@ def _generate_image_asset(prompt: str, image_type: str) -> Asset:
     )
     try:
         with request.urlopen(req, timeout=timeout) as resp:
-            file_bytes = resp.read()
+            return resp.read()
     except error.HTTPError as exc:
         if exc.code in {401, 403}:
             raise AiApiError(401, "External AI service rejected RT_AI_TOKEN") from exc
@@ -795,10 +1569,141 @@ def _generate_image_asset(prompt: str, image_type: str) -> Asset:
     except (error.URLError, TimeoutError) as exc:
         raise AiApiError(502, f"Image download failed: {exc}") from exc
 
-    mime_type = "image/jpeg" if image_type == "jpeg" else f"image/{image_type}"
-    asset = store_asset(file_bytes, f"generated_{message_id}.{image_type}", mime_type)
-    asset.meta = {"prompt": prompt, "externalMessageId": message_id}
-    return asset
+
+def _looks_like_russian(text: str) -> bool:
+    return any("а" <= ch.lower() <= "я" for ch in text)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _craft_image_prompt(
+    presentation_title: str,
+    slide: OutlineSlide,
+    style_hint: str,
+) -> str:
+    if _mock_enabled():
+        return f"{slide.title} — illustrative concept for {presentation_title}"
+    summary = "; ".join((slide.keyPoints or [])[:3]) or slide.purpose or slide.title
+    user_text = (
+        "Create a Stable Diffusion prompt (one line, no JSON) for the following slide.\n\n"
+        f"Presentation: {presentation_title}\n"
+        f"Slide title: {slide.title}\n"
+        f"Slide intent: {slide.purpose or '-'}\n"
+        f"Key ideas: {summary}\n"
+        f"Visual intent (Russian, optional): {slide.visualIntent or '-'}\n"
+        f"Visual style guidance: {style_hint}\n"
+        "Important: no text, captions, logos, watermarks. Subject-led, photographic or "
+        "tasteful illustration, cinematic composition."
+    )
+    try:
+        text = _call_qwen_text(
+            user_text=user_text,
+            system_prompt=IMAGE_PROMPT_SYSTEM,
+            max_new_tokens=220,
+            temperature=0.85,
+            top_p=0.95,
+        )
+    except AiApiError:
+        return f"{slide.title} — {style_hint}, no text, no logos"
+    return text.strip().strip('"').strip("`").splitlines()[0].strip() or slide.title
+
+
+def _replace_slide_in_document(
+    doc: PresentationDocument,
+    slide_index: int,
+    new_outline: OutlineSlide,
+    full_outline: PresentationOutline,
+) -> None:
+    """Replaces a slide's text and refreshes its image-generation metadata in place."""
+    slide = doc.slides[slide_index]
+    slide.name = new_outline.title
+    slide.notes = new_outline.speakerNotes or new_outline.purpose
+    slide.meta = {**(slide.meta or {}), "outlineOrder": new_outline.order}
+    for el in slide.elements:
+        if el.type == "text":
+            role = (el.contentBehavior.fillRole if el.contentBehavior else None) or el.role
+            el.text = _text_for_role(role, new_outline, full_outline)
+        elif el.type == "image":
+            prompt = new_outline.imagePrompt or new_outline.visualIntent or new_outline.title
+            el.assetId = None
+            el.placeholder = new_outline.visualIntent or "Картинка генерируется…"
+            el.generation = {"prompt": prompt, "model": "stable-diffusion"}
+            el.meta = {
+                **(el.meta or {}),
+                "imageGeneration": {"status": "pending", "prompt": prompt},
+            }
+
+    generation = (doc.meta or {}).get("generation") or {}
+    outline_data = generation.get("outline") or full_outline.model_dump(mode="json")
+    if isinstance(outline_data, dict):
+        slides = list(outline_data.get("slides") or [])
+        replaced = new_outline.model_dump(mode="json")
+        for i, item in enumerate(slides):
+            if int(item.get("order") or i + 1) == new_outline.order:
+                slides[i] = replaced
+                break
+        else:
+            slides.append(replaced)
+        outline_data["slides"] = slides
+    doc.meta = {
+        **(doc.meta or {}),
+        "generation": {**generation, "outline": outline_data},
+    }
+
+
+def _outline_from_document(doc: PresentationDocument) -> dict[str, Any]:
+    return {
+        "title": doc.name,
+        "audience": None,
+        "goal": None,
+        "slides": [
+            _outline_slide_from_doc_slide(slide, idx + 1).model_dump(mode="json")
+            for idx, slide in enumerate(doc.slides)
+        ],
+    }
+
+
+def _outline_slide_from_doc_slide(slide: SlideDocument, order: int) -> OutlineSlide:
+    title = ""
+    body_lines: list[str] = []
+    image_prompt: str | None = None
+    visual_intent: str | None = None
+    needs_image = False
+    for el in slide.elements:
+        if el.type == "text":
+            role = (el.contentBehavior.fillRole if el.contentBehavior else None) or el.role
+            text = (el.text or "").strip()
+            if not text:
+                continue
+            if role == "title" and not title:
+                title = text
+            elif role == "bulletList":
+                body_lines.extend(line.strip("•- ").strip() for line in text.splitlines() if line.strip())
+            else:
+                body_lines.extend(line.strip() for line in text.splitlines() if line.strip())
+        elif el.type == "image":
+            needs_image = True
+            gen = el.generation
+            if gen and gen.prompt:
+                image_prompt = gen.prompt
+    return OutlineSlide(
+        order=order,
+        title=title or slide.name or f"Слайд {order}",
+        purpose="",
+        keyPoints=[line for line in body_lines if line],
+        visualIntent=visual_intent,
+        needsImage=needs_image,
+        slideType=slide.slideType,
+        imagePrompt=image_prompt,
+        speakerNotes=slide.notes,
+    )
+
+
+def _default_basis_dict() -> dict[str, Any]:
+    return {"kind": "style", "styleId": "business"}
 
 
 def _text_for_role(
@@ -848,36 +1753,47 @@ def _mock_outline(
         if idx == 1:
             slide_type = "title"
             slide_title = title
-            points = ["Контекст", "Цель презентации"]
+            points = [
+                "Контекст рынка и почему сейчас удачный момент",
+                "Что обещаем команде/инвесторам в результате",
+            ]
         elif idx == payload.slideCount:
             slide_type = "conclusion"
-            slide_title = "Итоги и следующий шаг"
-            points = ["Главный вывод", "Решение или действие"]
+            slide_title = "Что мы предлагаем сделать на следующей неделе"
+            points = ["Главное решение, которое нужно принять", "Конкретный следующий шаг"]
         elif idx % 4 == 0:
             slide_type = "image"
-            slide_title = f"Визуальный акцент {idx}"
-            points = ["Ключевой образ", "Поддерживающий тезис"]
+            slide_title = f"Иллюстрация ключевой метафоры #{idx}"
+            points = ["Визуальная метафора, которая закрепляет идею", "Один сильный поддерживающий тезис"]
         else:
             slide_type = "bullets"
-            slide_title = f"Раздел {idx}"
-            points = ["Тезис 1", "Тезис 2", "Тезис 3"]
+            slide_title = f"Основной аргумент #{idx} в пользу темы"
+            points = [
+                "Цифра/факт #1, доказывающий аргумент",
+                "Цифра/факт #2, развивающий мысль",
+                "Импликация для команды",
+            ]
         if feedback:
             points.append(f"Учтено: {feedback[:80]}")
         slides.append(
             OutlineSlide(
                 order=idx,
                 title=slide_title,
-                purpose=f"Раскрыть часть темы: {title}",
+                purpose=f"Развить идею: {title}",
                 keyPoints=points,
-                visualIntent=f"Чистая презентационная графика по теме: {slide_title}",
+                visualIntent=f"Визуал по теме: {slide_title}",
                 needsImage=slide_type == "image",
                 slideType=slide_type,
+                imagePrompt=(
+                    f"editorial photography illustrating the idea of {slide_title}, "
+                    "no text, cinematic lighting, premium B2B feel"
+                ),
             )
         )
     return PresentationOutline(
         title=title,
         audience="Целевая аудитория из запроса",
-        goal="Собрать понятную и редактируемую презентацию",
+        goal="Принять конкретное решение по теме",
         slides=slides,
     )
 
@@ -903,32 +1819,6 @@ def _coerce_str_list(value: Any) -> list[str]:
     if isinstance(value, list):
         return [str(item).strip() for item in value if str(item).strip()]
     return [str(value)]
-
-
-def _outline_schema_hint(include_content: bool = False) -> dict[str, Any]:
-    slide_content_note = (
-        "keyPoints should contain final slide text, not only headings"
-        if include_content
-        else "keyPoints should contain short outline bullets"
-    )
-    return {
-        "title": "string",
-        "audience": "string",
-        "goal": "string",
-        "slides": [
-            {
-                "order": "number",
-                "title": "string",
-                "purpose": "string",
-                "keyPoints": slide_content_note,
-                "visualIntent": "string",
-                "needsImage": "boolean",
-                "slideType": "title|text|image|bullets|conclusion",
-                "imagePrompt": "string",
-                "speakerNotes": "string",
-            }
-        ],
-    }
 
 
 def _title_from_prompt(prompt: str) -> str:
@@ -961,3 +1851,7 @@ def _new_id(prefix: str) -> str:
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
+
+
+def cleanup_jobs_for_presentation(presentation_id: str) -> None:
+    delete_image_jobs(presentation_id)

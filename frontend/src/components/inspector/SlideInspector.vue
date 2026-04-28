@@ -91,6 +91,55 @@
       <h4>Заметки</h4>
       <textarea :value="slide.notes || ''" rows="4" @input="(e) => updateSlide({ notes: e.target.value })" />
     </div>
+
+    <div v-if="docStore.mode === 'presentation'" class="inspector-section ai-section">
+      <h4>
+        <span>AI-перегенерация</span>
+        <span v-if="hasPendingImage" class="ac-pill ai-pending">картинка готовится…</span>
+      </h4>
+
+      <div class="inspector-row">
+        <label>Уточнения</label>
+        <textarea
+          v-model="regenerateInstructions"
+          rows="3"
+          placeholder="Например: добавь конкретные цифры за Q3 и упомяни enterprise-сегмент"
+        />
+      </div>
+      <div class="inspector-row">
+        <button
+          class="tb-btn primary"
+          :disabled="regenerating"
+          style="width: 100%; justify-content: center;"
+          @click="regenerateSlide"
+        >
+          {{ regenerating ? 'Перегенерируем…' : 'Перегенерировать слайд' }}
+        </button>
+      </div>
+
+      <template v-if="hasImage">
+        <div class="inspector-row" style="margin-top: 10px;">
+          <label>Промпт картинки</label>
+          <textarea
+            v-model="imagePromptOverride"
+            rows="3"
+            :placeholder="defaultImagePromptPlaceholder"
+          />
+        </div>
+        <div class="inspector-row">
+          <button
+            class="tb-btn"
+            :disabled="regeneratingImage"
+            style="width: 100%; justify-content: center;"
+            @click="regenerateImage"
+          >
+            {{ regeneratingImage ? 'Запускаем…' : 'Перегенерировать картинку' }}
+          </button>
+        </div>
+      </template>
+
+      <div v-if="aiError" class="ai-error">{{ aiError }}</div>
+    </div>
   </div>
 </template>
 
@@ -128,12 +177,40 @@ export default {
       slideTypeOptions: SLIDE_TYPE_OPTIONS,
       backgroundTypeOptions: BACKGROUND_TYPE_OPTIONS,
       fitOptions: FIT_OPTIONS,
+      regenerateInstructions: '',
+      imagePromptOverride: '',
+      regenerating: false,
+      regeneratingImage: false,
+      aiError: '',
     };
   },
   computed: {
     docStore() { return useDocumentStore(); },
     imageAssets() {
       return (this.docStore.doc?.assets || []).filter((asset) => asset.type === 'image');
+    },
+    imageElement() {
+      return this.slide.elements.find((el) => el.type === 'image') || null;
+    },
+    hasImage() {
+      return Boolean(this.imageElement);
+    },
+    hasPendingImage() {
+      const meta = this.imageElement?.meta?.imageGeneration;
+      return Boolean(meta && (meta.status === 'pending' || meta.status === 'in_progress'));
+    },
+    defaultImagePromptPlaceholder() {
+      const current = this.imageElement?.generation?.prompt
+        || this.imageElement?.meta?.imageGeneration?.prompt;
+      if (current) return current.slice(0, 140);
+      return '(опционально) английский prompt для Stable Diffusion';
+    },
+  },
+  watch: {
+    'slide.id'() {
+      this.regenerateInstructions = '';
+      this.imagePromptOverride = '';
+      this.aiError = '';
     },
   },
   methods: {
@@ -161,6 +238,103 @@ export default {
       });
       event.target.value = '';
     },
+    async ensureSaved() {
+      if (!this.docStore.dirty) return true;
+      try {
+        await api.savePresentation(this.docStore.doc);
+        this.docStore.markSaved(this.docStore.revision);
+        return true;
+      } catch (err) {
+        this.aiError = this.errorText(err, 'Не удалось сохранить перед перегенерацией.');
+        return false;
+      }
+    },
+    async regenerateSlide() {
+      if (this.regenerating) return;
+      this.aiError = '';
+      const presentationId = this.docStore.doc?.id;
+      if (!presentationId) return;
+      if (!(await this.ensureSaved())) return;
+      this.regenerating = true;
+      try {
+        const updated = await api.regenerateSlideContent(presentationId, this.slide.id, {
+          instructions: this.regenerateInstructions.trim() || null,
+        });
+        this.docStore.replacePresentation(updated);
+        this.docStore.kickImagePolling();
+        this.regenerateInstructions = '';
+      } catch (err) {
+        this.aiError = this.errorText(err, 'Не удалось перегенерировать слайд.');
+      } finally {
+        this.regenerating = false;
+      }
+    },
+    async regenerateImage() {
+      if (this.regeneratingImage) return;
+      this.aiError = '';
+      const presentationId = this.docStore.doc?.id;
+      if (!presentationId) return;
+      if (!(await this.ensureSaved())) return;
+      this.regeneratingImage = true;
+      try {
+        const job = await api.regenerateSlideImage(presentationId, this.slide.id, {
+          prompt: this.imagePromptOverride.trim() || null,
+        });
+        if (this.imageElement) {
+          const meta = { ...(this.imageElement.meta || {}) };
+          meta.imageGeneration = {
+            ...(meta.imageGeneration || {}),
+            status: job?.status || 'pending',
+            prompt: job?.prompt,
+          };
+          this.docStore.run({
+            type: 'element.updateProps',
+            slideId: this.slide.id,
+            elementId: this.imageElement.id,
+            payload: { props: { meta, assetId: null, placeholder: 'Картинка генерируется…' } },
+          });
+        }
+        this.docStore.kickImagePolling();
+        this.imagePromptOverride = '';
+      } catch (err) {
+        this.aiError = this.errorText(err, 'Не удалось запустить перегенерацию картинки.');
+      } finally {
+        this.regeneratingImage = false;
+      }
+    },
+    errorText(err, fallback) {
+      const detail = err?.detail?.detail || err?.detail;
+      if (typeof detail === 'string' && detail.trim()) return detail;
+      if (detail && typeof detail === 'object') return JSON.stringify(detail);
+      return fallback;
+    },
   },
 };
 </script>
+
+<style scoped>
+.ai-section h4 {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.ai-pending {
+  background: rgba(255, 181, 71, 0.14);
+  border: 1px solid rgba(255, 181, 71, 0.32);
+  color: var(--amber-200, #ffb547);
+  padding: 2px 8px;
+  font-size: 10.5px;
+  border-radius: 999px;
+  font-weight: 500;
+}
+.ai-error {
+  margin-top: 8px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: rgba(239, 93, 74, 0.10);
+  border: 1px solid rgba(239, 93, 74, 0.32);
+  color: #ef5d4a;
+  font-size: 11.5px;
+  line-height: 1.4;
+}
+</style>

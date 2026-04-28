@@ -71,4 +71,16 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(payload),
     }),
+  getImageJobsStatus: (presentationId) =>
+    request(`/api/ai/presentations/${presentationId}/images/status`),
+  regenerateSlideContent: (presentationId, slideId, payload) =>
+    request(`/api/ai/presentations/${presentationId}/slides/${slideId}/regenerate`, {
+      method: 'POST',
+      body: JSON.stringify(payload || {}),
+    }),
+  regenerateSlideImage: (presentationId, slideId, payload) =>
+    request(`/api/ai/presentations/${presentationId}/slides/${slideId}/image/regenerate`, {
+      method: 'POST',
+      body: JSON.stringify(payload || {}),
+    }),
 };

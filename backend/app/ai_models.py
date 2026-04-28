@@ -78,3 +78,41 @@ class ImagePolicy(BaseModel):
 class PresentationBuildRequest(BaseModel):
     outline: PresentationOutline
     imagePolicy: ImagePolicy = Field(default_factory=ImagePolicy)
+
+
+class SlideRegenerateRequest(BaseModel):
+    instructions: Optional[str] = Field(default=None, max_length=2000)
+
+
+class ImageRegenerateRequest(BaseModel):
+    prompt: Optional[str] = Field(default=None, max_length=2000)
+    imageType: Optional[Literal["png", "bmp", "gif", "tiff", "jpeg"]] = None
+
+
+class ImageJobAsset(BaseModel):
+    id: str
+    type: Literal["image"] = "image"
+    mimeType: str
+    url: Optional[str] = None
+    fileName: Optional[str] = None
+
+
+class ImageJobView(BaseModel):
+    id: str
+    slideId: str
+    elementId: str
+    prompt: str
+    imageType: str
+    status: Literal["pending", "in_progress", "ready", "failed"]
+    assetId: Optional[str] = None
+    url: Optional[str] = None
+    asset: Optional[ImageJobAsset] = None
+    error: Optional[str] = None
+    version: int = 1
+    createdAt: int
+    updatedAt: int
+
+
+class ImageJobsResponse(BaseModel):
+    presentationId: str
+    jobs: list[ImageJobView] = Field(default_factory=list)
