@@ -737,6 +737,35 @@ a { color: inherit; text-decoration: none; }
   border-top: 1px solid var(--line);
   flex-wrap: wrap;
 }
+.composer-basis-toggle {
+  display: inline-flex;
+  gap: 2px;
+  padding: 2px;
+  background: var(--ink-1);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+.composer-basis-toggle button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 9px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--fg-3);
+  font-size: 12.5px;
+  cursor: pointer;
+}
+.composer-basis-toggle button:hover {
+  color: var(--fg-1);
+  background: var(--ink-3);
+}
+.composer-basis-toggle button.active {
+  color: var(--fg-1);
+  background: var(--ink-4);
+  box-shadow: 0 1px 0 rgba(255,255,255,0.04) inset;
+}
 .composer-counter { color: var(--fg-4); font-size: 11.5px; margin-left: auto; }
 
 .examples {
