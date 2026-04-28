@@ -71,4 +71,12 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(payload),
     }),
+
+  importPptx: async (file) => {
+    const fd = new FormData();
+    fd.append('file', file);
+    const res = await fetch('/api/ai/generations/import-pptx', { method: 'POST', body: fd });
+    if (!res.ok) throw new Error(`Import failed: ${res.status}`);
+    return res.json();
+  },
 };

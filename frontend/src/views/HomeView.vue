@@ -153,6 +153,10 @@
         <button class="tb-btn" @click="createTemplate">
           <AcIcon name="plus" :size="13" /> Новый шаблон
         </button>
+        <button class="tb-btn" @click="$refs.pptxInput.click()" :disabled="pptxImporting">
+          <AcIcon name="upload" :size="13" /> {{ pptxImporting ? 'Импорт...' : 'Загрузить PPTX' }}
+        </button>
+        <input ref="pptxInput" type="file" accept=".pptx" style="display: none" @change="importPptx" />
       </div>
       <div v-if="templates.length" class="template-grid">
         <router-link
@@ -346,6 +350,7 @@ export default {
       generationLoading: false,
       buildingPresentation: false,
       generationError: '',
+      pptxImporting: false,
       examples: [
         'Презентация для инвесторов: SaaS B2B, 10 слайдов, упор на трекшн',
         'Внутренний отчёт по итогам Q3 для команды product-маркетинга',
@@ -655,6 +660,25 @@ export default {
       ];
       if (!this.composerTpl) this.composerTpl = saved.name;
       this.$router.push(`/templates/${saved.id}`);
+    },
+    async importPptx(event) {
+      const file = event.target.files[0];
+      if (!file) return;
+      this.pptxImporting = true;
+      try {
+        const importedTpl = await api.importPptx(file);
+        this.templates = [
+          { id: importedTpl.id, name: importedTpl.name, slideSize: importedTpl.slideSize },
+          ...this.templates.filter((t) => t.id !== importedTpl.id),
+        ];
+        if (!this.composerTpl) this.composerTpl = importedTpl.name;
+        this.$router.push(`/templates/${importedTpl.id}`);
+      } catch (err) {
+        alert('Ошибка импорта PPTX: ' + this.apiErrorMessage(err, 'Неизвестная ошибка'));
+      } finally {
+        this.pptxImporting = false;
+      }
+      event.target.value = ''; // reset input
     },
   },
 };
