@@ -32,13 +32,21 @@ export default {
   },
   emits: ['start-edit', 'commit-text', 'select'],
   computed: {
+    isBulletList() {
+      return this.element.role === 'bulletList';
+    },
     display() {
       const text = this.element.text;
       if (text && text.length > 0) {
-        return this.escape(text).replace(/\n/g, '<br>');
+        return this.isBulletList
+          ? this.renderBulletHtml(text)
+          : this.escape(text).replace(/\n/g, '<br>');
       }
-      const ph = this.element.placeholder || 'Текст';
-      return `<span class="placeholder">${this.escape(ph)}</span>`;
+      const placeholder = this.element.placeholder
+        || (this.isBulletList ? 'Пункт 1\nПункт 2\nПункт 3' : 'Текст');
+      return this.isBulletList
+        ? this.renderBulletHtml(placeholder, true)
+        : `<span class="placeholder">${this.escape(placeholder)}</span>`;
     },
     textStyle() {
       const s = this.element.style || {};
@@ -76,6 +84,27 @@ export default {
     if (this.editing) this.initEditor();
   },
   methods: {
+    bulletLines(text) {
+      return String(text)
+        .split('\n')
+        .map((line) => line.replace(/^[\s\u2022*-]+\s*/, '').trim())
+        .filter(Boolean);
+    },
+    renderBulletHtml(text, placeholder = false) {
+      const lines = this.bulletLines(text);
+      if (!lines.length) {
+        return placeholder
+          ? '<ul class="bullet-list"><li><span class="placeholder">Пункт списка</span></li></ul>'
+          : '';
+      }
+      const items = lines.map((line) => {
+        const content = this.escape(line);
+        return placeholder
+          ? `<li><span class="placeholder">${content}</span></li>`
+          : `<li>${content}</li>`;
+      }).join('');
+      return `<ul class="bullet-list">${items}</ul>`;
+    },
     initEditor() {
       const el = this.$refs.root;
       if (!el) return;

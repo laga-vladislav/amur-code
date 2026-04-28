@@ -32,7 +32,7 @@
     </div>
     <div class="canvas-meta">
       <span>{{ slideSize.ratio }}</span>
-      <span>{{ slideSize.widthEmu.toLocaleString('ru-RU') }} × {{ slideSize.heightEmu.toLocaleString('ru-RU') }} EMU</span>
+      <span>{{ slideSizeLabel }}</span>
     </div>
   </div>
 </template>
@@ -41,7 +41,7 @@
 import ElementFrame from './ElementFrame.vue';
 import { useDocumentStore } from '../../stores/document.js';
 import { useEditorStore } from '../../stores/editor.js';
-import { fitScale } from '../../core/emu.js';
+import { emuToCm, fitScale, roundNumber } from '../../core/emu.js';
 
 function rectsIntersect(a, b) {
   return !(a.x + a.w < b.x || b.x + b.w < a.x || a.y + a.h < b.y || b.y + b.h < a.y);
@@ -125,6 +125,11 @@ export default {
         width: `${this.marquee.w}px`,
         height: `${this.marquee.h}px`,
       };
+    },
+    slideSizeLabel() {
+      const widthCm = roundNumber(emuToCm(this.slideSize.widthEmu), 2).toLocaleString('ru-RU');
+      const heightCm = roundNumber(emuToCm(this.slideSize.heightEmu), 2).toLocaleString('ru-RU');
+      return `${widthCm} × ${heightCm} см`;
     },
     slideNumberLabel() {
       if (this.docStore.mode !== 'presentation') return '';
@@ -214,7 +219,6 @@ export default {
       const sel = { x: m.x, y: m.y, w: m.w, h: m.h };
       const ids = [];
       this.slide.elements.forEach((el) => {
-        if (el.visible === false) return;
         const r = {
           x: el.frame.xEmu * this.scale,
           y: el.frame.yEmu * this.scale,
