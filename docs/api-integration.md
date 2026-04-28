@@ -94,7 +94,10 @@ Authorization: Bearer <RT_AI_TOKEN>
 RT_AI_BASE_URL=https://ai.rt.ru/api/1.0
 RT_AI_TOKEN=...
 RT_AI_LLM_MODEL=Qwen/Qwen2.5-72B-Instruct
+RT_AI_MOCK=0
 ```
+
+For local contract checks without external calls, set `RT_AI_MOCK=1`.
 
 ## Internal Frontend-To-Backend API
 
@@ -260,4 +263,3 @@ The backend validates and normalizes model output before creating `PresentationD
 - `401`: backend token is missing or rejected by the external service.
 - `409`: the generation is in the wrong state, for example presentation build before outline approval.
 - `502`: external Qwen or SD call failed.
-
