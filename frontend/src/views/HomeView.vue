@@ -65,7 +65,7 @@
           <button
             class="tb-btn primary"
             style="padding:8px 14px;"
-            :disabled="!composerTpl || !createName"
+            :disabled="templates.length > 0 && !composerTpl"
             @click="generate"
           >
             <AcIcon name="sparkle" :size="14" />
@@ -223,13 +223,26 @@ export default {
       return this.templates.map((t) => t.name);
     },
   },
+  beforeRouteEnter(_to, _from, next) {
+    next((vm) => vm.loadHome());
+  },
   async mounted() {
-    await this.refresh();
-    if (!this.composerTpl && this.templates.length) {
-      this.composerTpl = this.templates[0].name;
-    }
+    await this.loadHome();
+    window.addEventListener('focus', this.refresh);
+  },
+  activated() {
+    this.loadHome();
+  },
+  beforeUnmount() {
+    window.removeEventListener('focus', this.refresh);
   },
   methods: {
+    async loadHome() {
+      await this.refresh();
+      if (!this.composerTpl && this.templates.length) {
+        this.composerTpl = this.templates[0].name;
+      }
+    },
     async refresh() {
       [this.presentations, this.templates] = await Promise.all([
         api.listPresentations(),
@@ -275,6 +288,15 @@ export default {
         doc.slides[0].notes = this.prompt;
       }
       const saved = await api.createPresentation(doc);
+      this.presentations = [
+        {
+          id: saved.id,
+          name: saved.name,
+          templateId: saved.templateId,
+          slideCount: saved.slides?.length || 0,
+        },
+        ...this.presentations.filter((p) => p.id !== saved.id),
+      ];
       this.createOpen = false;
       this.$router.push(`/presentations/${saved.id}`);
     },
@@ -308,6 +330,11 @@ export default {
         assets: [],
       };
       const saved = await api.createTemplate(tpl);
+      this.templates = [
+        { id: saved.id, name: saved.name, slideSize: saved.slideSize },
+        ...this.templates.filter((t) => t.id !== saved.id),
+      ];
+      if (!this.composerTpl) this.composerTpl = saved.name;
       this.$router.push(`/templates/${saved.id}`);
     },
   },

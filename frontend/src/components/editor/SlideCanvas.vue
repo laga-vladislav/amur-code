@@ -310,6 +310,7 @@ export default {
       this.resize = { id, start, moved: false };
       window.addEventListener('mousemove', this.onResizeMove);
       window.addEventListener('mouseup', this.onResizeEnd, { once: true });
+      event.stopPropagation();
       event.preventDefault();
     },
     onResizeMove(e) {
@@ -385,12 +386,17 @@ export default {
       const sel = this.docStore.selection;
 
       // Undo/redo always available unless typing inside an input where the browser owns Z.
-      if (!isField && (e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'z' && !e.shiftKey) {
+      const key = e.key.toLowerCase();
+      const code = e.code;
+      const isUndo = code === 'KeyZ' || key === 'z';
+      const isRedo = code === 'KeyY' || key === 'y';
+
+      if (!isField && (e.metaKey || e.ctrlKey) && isUndo && !e.shiftKey) {
         e.preventDefault();
         this.docStore.undo();
         return;
       }
-      if (!isField && (e.metaKey || e.ctrlKey) && (e.key.toLowerCase() === 'y' || (e.key.toLowerCase() === 'z' && e.shiftKey))) {
+      if (!isField && (e.metaKey || e.ctrlKey) && (isRedo || (isUndo && e.shiftKey))) {
         e.preventDefault();
         this.docStore.redo();
         return;

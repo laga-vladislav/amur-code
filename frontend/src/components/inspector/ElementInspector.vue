@@ -36,19 +36,19 @@
       <h4>Геометрия (EMU)</h4>
       <div class="inspector-row">
         <label>X</label>
-        <input type="number" :value="el.frame.xEmu" @input="(e) => updateFrame({ xEmu: +e.target.value })" />
+        <input type="number" :value="el.frame.xEmu" @input="(e) => updateFrameInput({ xEmu: e.target.value })" />
         <label style="width:auto;">Y</label>
-        <input type="number" :value="el.frame.yEmu" @input="(e) => updateFrame({ yEmu: +e.target.value })" />
+        <input type="number" :value="el.frame.yEmu" @input="(e) => updateFrameInput({ yEmu: e.target.value })" />
       </div>
       <div class="inspector-row">
         <label>Ширина</label>
-        <input type="number" :value="el.frame.wEmu" @input="(e) => updateSize('w', +e.target.value)" />
+        <input type="number" :value="el.frame.wEmu" @input="(e) => updateSizeInput('w', e.target.value)" />
         <label style="width:auto;">Высота</label>
-        <input type="number" :value="el.frame.hEmu" @input="(e) => updateSize('h', +e.target.value)" />
+        <input type="number" :value="el.frame.hEmu" @input="(e) => updateSizeInput('h', e.target.value)" />
       </div>
       <div class="inspector-row">
         <label>Поворот</label>
-        <input type="number" step="1" :value="el.frame.rotate || 0" @input="(e) => updateFrame({ rotate: +e.target.value })" />
+        <input type="number" step="1" :value="el.frame.rotate || 0" @input="(e) => updateFrameInput({ rotate: e.target.value })" />
         <label style="width:auto;">z-index</label>
         <input type="number" :value="el.zIndex" @input="(e) => updateProps({ zIndex: +e.target.value })" />
       </div>
@@ -315,7 +315,28 @@ export default {
     onPreserveAspect(v) {
       this.updateProps({ preserveAspect: v });
     },
+    numberFromInput(value) {
+      if (value === '' || value == null) return null;
+      const n = Number(value);
+      return Number.isFinite(n) ? n : null;
+    },
+    updateSizeInput(axis, value) {
+      const n = this.numberFromInput(value);
+      if (n == null) return;
+      const min = axis === 'w' ? 100000 : 50000;
+      this.updateSize(axis, Math.max(min, Math.round(n)));
+    },
+    updateFrameInput(patch) {
+      const next = {};
+      Object.entries(patch).forEach(([key, value]) => {
+        const n = this.numberFromInput(value);
+        if (n == null) return;
+        next[key] = key === 'rotate' ? n : Math.round(n);
+      });
+      if (Object.keys(next).length) this.updateFrame(next);
+    },
     updateSize(axis, val) {
+      if (!Number.isFinite(val)) return;
       const f = { ...this.el.frame };
       if (this.el.type === 'image' && this.el.preserveAspect) {
         const ratio = (this.el.frame.wEmu || 1) / (this.el.frame.hEmu || 1);

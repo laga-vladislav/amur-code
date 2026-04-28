@@ -15,8 +15,10 @@
           draggable="true"
           @click="select(slide.id)"
           @dragstart="onDragStart(idx, $event)"
-          @dragover.prevent="onDragOver(idx)"
-          @drop.prevent="onDrop(idx)"
+          @dragenter.prevent
+          @dragover.prevent="onDragOver(idx, $event)"
+          @drop.prevent="onDrop(idx, $event)"
+          @dragend="onDragEnd"
         >
           <div class="thumb-index">{{ String(idx + 1).padStart(2, '0') }}</div>
           <div class="thumb-frame">
@@ -110,7 +112,7 @@
 import AcIcon from '../AcIcon.vue';
 import SlideThumbnail from './SlideThumbnail.vue';
 import { useDocumentStore } from '../../stores/document.js';
-import { makeSlide, slideFromLayout } from '../../core/factories.js';
+import { makeBackgroundColor, makeSlide, slideFromLayout } from '../../core/factories.js';
 import { uid } from '../../core/ids.js';
 
 export default {
@@ -147,14 +149,23 @@ export default {
     onDragStart(idx, e) {
       this.dragFromIndex = idx;
       e.dataTransfer.effectAllowed = 'move';
+      e.dataTransfer.setData('text/plain', String(idx));
     },
-    onDragOver() {},
-    onDrop(toIdx) {
-      if (this.dragFromIndex == null || this.dragFromIndex === toIdx) return;
+    onDragOver(idx, e) {
+      if (this.dragFromIndex == null || this.dragFromIndex === idx) return;
+      e.dataTransfer.dropEffect = 'move';
+    },
+    onDrop(toIdx, e) {
+      const raw = e.dataTransfer.getData('text/plain');
+      const fromIdx = this.dragFromIndex ?? (raw === '' ? null : Number(raw));
+      if (!Number.isInteger(fromIdx) || fromIdx === toIdx) return;
       this.docStore.run({
         type: 'slide.reorder',
-        payload: { fromIndex: this.dragFromIndex, toIndex: toIdx },
+        payload: { fromIndex: fromIdx, toIndex: toIdx },
       });
+      this.dragFromIndex = null;
+    },
+    onDragEnd() {
       this.dragFromIndex = null;
     },
     openLayoutPicker() {
@@ -165,7 +176,10 @@ export default {
       this.layoutPickerOpen = true;
     },
     addBlankSlide() {
-      const slide = makeSlide({ slideType: 'text' });
+      const slide = makeSlide({
+        slideType: 'text',
+        background: makeBackgroundColor(this.doc?.theme?.colors?.background || '#FFFFFF'),
+      });
       this.docStore.run({ type: 'slide.add', payload: { slide } });
       this.docStore.selectActiveSlide(slide.id);
       this.layoutPickerOpen = false;
@@ -199,11 +213,11 @@ export default {
         id: uid('layout'),
         name: 'Новый макет',
         slideType: 'text',
-        background: { type: 'color', value: '#FFFFFF' },
+        background: makeBackgroundColor(this.doc?.theme?.colors?.background || '#FFFFFF'),
         elements: [],
       };
       this.doc.layouts.push(layout);
-      this.docStore.dirty = true;
+      this.docStore.markDirty();
       this.docStore.selectActiveLayout(layout.id);
     },
     deleteLayout() {
@@ -211,7 +225,7 @@ export default {
       if (!id) return;
       const idx = this.layouts.findIndex((l) => l.id === id);
       this.doc.layouts = this.layouts.filter((l) => l.id !== id);
-      this.docStore.dirty = true;
+      this.docStore.markDirty();
       const next = this.layouts[Math.max(0, idx - 1)];
       this.docStore.selectActiveLayout(next?.id || null);
     },

@@ -100,7 +100,20 @@ export default {
       });
       this.docStore.setSelection(el.id);
     },
-    addText() { this.addElement(makeTextElement()); },
+    addText() {
+      const theme = this.docStore.doc?.theme;
+      this.addElement(makeTextElement({
+        style: {
+          fontFamily: theme?.fonts?.body || 'Inter',
+          fontSize: 24,
+          fontWeight: 400,
+          color: theme?.colors?.text || '#111827',
+          align: 'left',
+          valign: 'top',
+          lineHeight: 1.4,
+        },
+      }));
+    },
     addRect() { this.addElement(makeShapeElement('rect')); },
     addLine() { this.addElement(makeLineElement()); },
     addImage() { this.$refs.upload.click(); },
