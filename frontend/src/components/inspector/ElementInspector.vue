@@ -330,6 +330,11 @@
       <h4>Изображение</h4>
 
       <div class="inspector-row">
+        <label>Подсказка</label>
+        <input type="text" :value="el.placeholder || ''" @input="(e) => updateProps({ placeholder: e.target.value })" />
+      </div>
+
+      <div class="inspector-row">
         <label>Файл</label>
         <select :value="el.assetId || ''" @change="(e) => replaceImage(e.target.value)">
           <option value="">— не выбрано —</option>
@@ -394,6 +399,7 @@ import ColorChip from './ColorChip.vue';
 import { useDocumentStore } from '../../stores/document.js';
 import { api } from '../../api/client.js';
 import { FONT_FAMILIES, ensureFont, availableWeights } from '../../core/fonts.js';
+import { resolveTextRolePreset } from '../../core/textRoles.js';
 import {
   cmToEmu,
   emuToCm,
@@ -427,6 +433,15 @@ const ROLE_OPTIONS = [
   { value: 'decorative', label: 'Декор' },
   { value: 'custom', label: 'Своя роль' },
 ];
+
+const ROLE_OPTION_VALUES_BY_TYPE = {
+  text: ['title', 'subtitle', 'body', 'caption', 'bulletList', 'footer', 'slideNumber', 'custom'],
+  image: ['image', 'logo', 'decorative', 'custom'],
+  shape: ['decorative', 'custom'],
+  line: ['decorative', 'custom'],
+  icon: ['logo', 'decorative', 'custom'],
+  group: ['decorative', 'custom'],
+};
 
 const BEHAVIOR_OPTIONS = [
   { value: 'static', label: 'Фиксированный' },
@@ -479,7 +494,6 @@ export default {
   },
   data() {
     return {
-      roleOptions: ROLE_OPTIONS,
       behaviorOptions: BEHAVIOR_OPTIONS,
       fitOptions: FIT_OPTIONS,
       shapeOptions: SHAPE_OPTIONS,
@@ -501,6 +515,18 @@ export default {
   computed: {
     docStore() { return useDocumentStore(); },
     el() { return this.element; },
+    roleOptions() {
+      const allowedValues = ROLE_OPTION_VALUES_BY_TYPE[this.el.type];
+      const options = allowedValues
+        ? ROLE_OPTIONS.filter((option) => allowedValues.includes(option.value))
+        : ROLE_OPTIONS;
+      if (!this.el.role || options.some((option) => option.value === this.el.role)) {
+        return options;
+      }
+      const current = ROLE_OPTIONS.find((option) => option.value === this.el.role)
+        || { value: this.el.role, label: this.el.role };
+      return [current, ...options];
+    },
     imageAssets() {
       return (this.docStore.doc?.assets || []).filter((asset) => asset.type === 'image');
     },
@@ -544,8 +570,36 @@ export default {
     },
     setRole(role) {
       const props = { role };
-      if (this.el.type === 'text' && role === 'bulletList' && !this.el.text && !this.el.placeholder) {
-        props.placeholder = 'Пункт 1\nПункт 2\nПункт 3';
+      let stylePatch = null;
+      if (this.el.type === 'text') {
+        const preset = resolveTextRolePreset(role, this.docStore.doc?.theme);
+        if (preset) {
+          stylePatch = {
+            fontFamily: preset.fontFamily,
+            fontSize: preset.fontSize,
+            fontWeight: preset.fontWeight,
+            color: preset.color,
+            lineHeight: preset.lineHeight,
+          };
+          if (!this.el.text) {
+            props.placeholder = preset.placeholder;
+          }
+        }
+      }
+      if (stylePatch) {
+        this.docStore.run({
+          type: 'element.updateStyle',
+          slideId: this.slide.id,
+          elementId: this.el.id,
+          payload: { style: stylePatch },
+        });
+        this.docStore.run({
+          type: 'element.updateProps',
+          slideId: this.slide.id,
+          elementId: this.el.id,
+          payload: { props },
+        }, { coalesce: true });
+        return;
       }
       this.updateProps(props);
     },
