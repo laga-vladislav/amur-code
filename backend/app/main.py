@@ -6,7 +6,7 @@ from .routers import ai, assets, presentations, templates
 from .seed import seed_if_empty
 from .storage import asset_path
 
-app = FastAPI(title="Amur Code — Presentation Editor", version="0.1.0")
+app = FastAPI(title="Presentation Editor", version="0.1.0")
 
 app.add_middleware(
     CORSMiddleware,

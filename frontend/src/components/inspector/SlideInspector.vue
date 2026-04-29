@@ -203,7 +203,7 @@ export default {
       const current = this.imageElement?.generation?.prompt
         || this.imageElement?.meta?.imageGeneration?.prompt;
       if (current) return current.slice(0, 140);
-      return '(опционально) английский prompt для Stable Diffusion';
+      return '(опционально) английский prompt для генерации изображения';
     },
   },
   watch: {

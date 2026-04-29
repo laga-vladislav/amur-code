@@ -15,6 +15,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -155,15 +156,17 @@ OUTLINE_SYSTEM_PROMPT = (
     "2. Каждый заголовок — формулировка, у которой видна позиция автора. Пример «плохо»: "
     "«Финансовые показатели». Пример «хорошо»: «Выручка выросла на 38% за счёт enterprise — "
     "и это меняет приоритеты команды».\n"
-    "3. keyPoints — короткие, осмысленные тезисы (5–14 слов), желательно с цифрами, фактами "
+    "3. Заголовок должен помещаться в 1–2 строки: обычно 45–75 символов. Длинную мысль переноси "
+    "в keyPoints или speakerNotes.\n"
+    "4. keyPoints — короткие, осмысленные тезисы (5–14 слов), желательно с цифрами, фактами "
     "или конкретными решениями. Никаких «Тезис 1 / Тезис 2».\n"
-    "4. Каждый слайд должен раскрывать что-то новое. Не повторяй мысль из предыдущего слайда.\n"
-    "5. Используй живой деловой русский язык, без канцелярита и общих мест.\n"
-    "6. visualIntent — короткое описание визуала на русском (что должно быть на слайде, "
-    "какая метафора). imagePrompt — детальный prompt для Stable Diffusion на АНГЛИЙСКОМ, "
+    "5. Каждый слайд должен раскрывать что-то новое. Не повторяй мысль из предыдущего слайда.\n"
+    "6. Используй живой деловой русский язык, без канцелярита и общих мест.\n"
+    "7. visualIntent — короткое описание визуала на русском (что должно быть на слайде, "
+    "какая метафора). imagePrompt — детальный prompt для генерации изображения на АНГЛИЙСКОМ, "
     "конкретный, с указанием стиля, света, композиции и цветовой палитры. Запрещены слова "
     "text, words, letters, logo, watermark, caption — внутри картинки текста быть не должно.\n"
-    "7. needsImage = true только если визуал реально усиливает мысль слайда. Не делай картинки "
+    "8. needsImage = true только если визуал реально усиливает мысль слайда. Не делай картинки "
     "ради картинок.\n\n"
     "Возвращай строго валидный JSON-объект без Markdown, без комментариев и без текста вокруг."
 )
@@ -184,7 +187,7 @@ CONTENT_SYSTEM_PROMPT = (
     "Не пересказывай заголовок.\n"
     "5. speakerNotes — 2–3 предложения, что докладчик может сказать вслух, расширяя тезисы.\n"
     "6. visualIntent — на русском, что должно быть в кадре и почему. imagePrompt — на АНГЛИЙСКОМ, "
-    "детальный prompt для Stable Diffusion: субъект, окружение, стиль, освещение, цветовая "
+    "детальный prompt для генерации изображения: субъект, окружение, стиль, освещение, цветовая "
     "палитра под выбранный стиль презентации, композиция (rule of thirds, close-up, wide shot). "
     "Никакого текста на изображении, без логотипов, без водяных знаков.\n"
     "7. needsImage = true только если визуал реально работает на смысл слайда.\n\n"
@@ -192,7 +195,7 @@ CONTENT_SYSTEM_PROMPT = (
 )
 
 IMAGE_PROMPT_SYSTEM = (
-    "You craft prompts for Stable Diffusion. Output ONE concise English prompt "
+    "You craft prompts for image generation. Output ONE concise English prompt "
     "(40-70 words) describing a single coherent scene. Include: subject, setting, "
     "art style, lighting, color palette, composition, mood. Add quality boosters "
     "like 'editorial photography', 'cinematic lighting', 'high detail'. "
@@ -222,7 +225,7 @@ def _outline_user_text(payload: dict[str, Any]) -> str:
         '      "visualIntent": "string — описание визуала на русском",\n'
         '      "needsImage": false,\n'
         '      "slideType": "title|text|image|bullets|conclusion",\n'
-        '      "imagePrompt": "string — детальный английский prompt для Stable Diffusion",\n'
+        '      "imagePrompt": "string — детальный английский prompt для генерации изображения",\n'
         '      "speakerNotes": "string — что сказать вслух (1-2 предложения)"\n'
         "    }\n"
         "  ]\n"
@@ -345,12 +348,33 @@ def build_presentation(
     if not outline.slides:
         raise AiApiError(422, "Approved outline must contain at least one slide")
 
-    content_outline = (
-        _mock_content(source_request, outline)
-        if _mock_enabled()
-        else _generate_slide_content(source_request, outline)
-    )
+    content_generation_error: str | None = None
+    if _mock_enabled():
+        content_outline = _mock_content(source_request, outline)
+    else:
+        try:
+            content_outline = _generate_slide_content(source_request, outline)
+        except AiApiError as exc:
+            if exc.status_code != 502:
+                raise
+            content_generation_error = str(exc.detail)
+            logger.warning(
+                "Presentation content generation failed for %s; using approved outline: %s",
+                generation_id,
+                exc.detail,
+            )
+            content_outline = _fallback_content(source_request, outline)
     doc = _build_document(source_request.basis, content_outline, payload.imagePolicy)
+    if content_generation_error:
+        generation_meta = (doc.meta or {}).get("generation") or {}
+        doc.meta = {
+            **(doc.meta or {}),
+            "generation": {
+                **generation_meta,
+                "contentFallback": True,
+                "contentFallbackReason": content_generation_error,
+            },
+        }
     saved = save_presentation(doc)
 
     if payload.imagePolicy.generateImages:
@@ -359,6 +383,8 @@ def build_presentation(
     record["status"] = "presentation_ready"
     record["approvedOutline"] = outline.model_dump(mode="json")
     record["contentOutline"] = content_outline.model_dump(mode="json")
+    if content_generation_error:
+        record["contentFallbackError"] = content_generation_error
     record["presentationId"] = saved.id
     record["updatedAt"] = _now_ms()
     _save_record(generation_id, record)
@@ -1024,6 +1050,7 @@ def _slide_from_layout(
             }
         if payload["type"] == "text":
             payload["text"] = _text_for_role(fill_role, slide_outline, outline)
+            _apply_text_fit(payload, fill_role)
         elif payload["type"] == "image":
             payload["assetId"] = None
             prompt = (
@@ -1034,7 +1061,7 @@ def _slide_from_layout(
             payload["placeholder"] = slide_outline.visualIntent or "Картинка генерируется…"
             payload["generation"] = {
                 "prompt": prompt,
-                "model": "stable-diffusion",
+                "model": _image_model_name(),
             }
             payload["meta"] = {
                 **(payload.get("meta") or {}),
@@ -1095,7 +1122,7 @@ def _style_slide(
             _text_element(
                 "title",
                 outline.title,
-                914400, 2200000, 10363200, 1200000,
+                914400, 2000000, 10363200, 1650000,
                 56, 700, theme.colors.text,
             )
         )
@@ -1105,18 +1132,21 @@ def _style_slide(
                 _text_element(
                     "subtitle",
                     subtitle,
-                    914400, 3600000, 10363200, 800000,
+                    914400, 3850000, 10363200, 900000,
                     28, 400, theme.colors.secondary,
                 )
             )
     else:
         title_w = 5200000 if is_image else 10363200
         body_w = 5200000 if is_image else 10363200
+        title_h = 1050000 if is_image else 950000
+        body_y = 1850000 if is_image else 1750000
+        body_h = 4100000 if is_image else 4300000
         elements.append(
             _text_element(
                 "title",
                 slide_outline.title,
-                914400, 700000, title_w, 800000,
+                914400, 700000, title_w, title_h,
                 38, 700, theme.colors.text,
             )
         )
@@ -1125,7 +1155,7 @@ def _style_slide(
             _text_element(
                 role,
                 _text_for_role(role, slide_outline, outline),
-                914400, 1750000, body_w, 4300000,
+                914400, body_y, body_w, body_h,
                 24, 400, theme.colors.text,
             )
         )
@@ -1148,6 +1178,113 @@ def _style_slide(
     )
 
 
+EMU_PER_PT = 12700
+
+TEXT_MIN_FONT_BY_ROLE = {
+    "title": 14,
+    "subtitle": 12,
+    "body": 11,
+    "bulletList": 11,
+    "caption": 9,
+}
+TEXT_MAX_LINES_BY_ROLE = {
+    "title": 2,
+    "subtitle": 3,
+    "body": 10,
+    "bulletList": 8,
+    "caption": 3,
+}
+TEXT_MAX_CHARS_BY_ROLE = {
+    "title": 110,
+    "subtitle": 180,
+    "body": 900,
+    "bulletList": 700,
+    "caption": 180,
+}
+TEXT_LINE_HEIGHT_BY_ROLE = {
+    "title": 1.12,
+    "subtitle": 1.22,
+    "body": 1.35,
+    "bulletList": 1.35,
+    "caption": 1.2,
+}
+
+
+def _text_constraints_for_role(role: str | None) -> dict[str, Any]:
+    role_key = role or "body"
+    constraints = {
+        "maxLines": TEXT_MAX_LINES_BY_ROLE.get(role_key, 8),
+        "overflow": "shrink",
+        "minFontSize": TEXT_MIN_FONT_BY_ROLE.get(role_key, 10),
+    }
+    max_chars = TEXT_MAX_CHARS_BY_ROLE.get(role_key)
+    if max_chars:
+        constraints["maxChars"] = max_chars
+    if role_key == "title":
+        constraints["splitStrategy"] = "none"
+    return constraints
+
+
+def _estimated_wrapped_lines(text: str, role: str | None, width_emu: int, font_size: int) -> int:
+    role_key = role or "body"
+    width_pt = max(20, width_emu / EMU_PER_PT - 8)
+    avg_char_width = max(4, font_size * (0.5 if role_key in {"title", "bulletList"} else 0.47))
+    chars_per_line = max(8, int(width_pt / avg_char_width))
+    total = 0
+    for raw_line in (text or "").splitlines() or [""]:
+        line = raw_line.strip()
+        if role_key == "bulletList":
+            line = line.lstrip("•-* ").strip()
+        total += max(1, math.ceil(max(1, len(line)) / chars_per_line))
+    return total
+
+
+def _fit_font_size(
+    text: str,
+    role: str | None,
+    width_emu: int,
+    height_emu: int,
+    font_size: int,
+    line_height: float,
+    min_font_size: int,
+) -> int:
+    height_pt = max(8, height_emu / EMU_PER_PT - 8)
+    size = font_size
+    while size > min_font_size:
+        lines = _estimated_wrapped_lines(text, role, width_emu, size)
+        if lines * size * line_height <= height_pt:
+            break
+        size -= 1
+    return size
+
+
+def _apply_text_fit(payload: dict[str, Any], role: str | None) -> None:
+    if payload.get("type") != "text":
+        return
+    style = payload.setdefault("style", {})
+    frame = payload.get("frame") or {}
+    constraints = payload.get("constraints") or {}
+    defaults = _text_constraints_for_role(role)
+    for key, value in defaults.items():
+        if constraints.get(key) is None:
+            constraints[key] = value
+    payload["constraints"] = constraints
+
+    line_height = style.get("lineHeight") or TEXT_LINE_HEIGHT_BY_ROLE.get(role or "body", 1.35)
+    style["lineHeight"] = line_height
+    font_size = int(style.get("fontSize") or 16)
+    min_font_size = int(constraints.get("minFontSize") or defaults["minFontSize"])
+    style["fontSize"] = _fit_font_size(
+        payload.get("text") or "",
+        role,
+        int(frame.get("wEmu") or 1),
+        int(frame.get("hEmu") or 1),
+        font_size,
+        float(line_height),
+        min_font_size,
+    )
+
+
 def _text_element(
     role: str,
     text: str,
@@ -1159,6 +1296,17 @@ def _text_element(
     font_weight: int,
     color: str,
 ) -> dict[str, Any]:
+    line_height = TEXT_LINE_HEIGHT_BY_ROLE.get(role, 1.35)
+    constraints = _text_constraints_for_role(role)
+    fitted_font_size = _fit_font_size(
+        text,
+        role,
+        w,
+        h,
+        font_size,
+        line_height,
+        constraints["minFontSize"],
+    )
     return {
         "id": _new_id("el"),
         "type": "text",
@@ -1168,12 +1316,13 @@ def _text_element(
         "frame": {"xEmu": x, "yEmu": y, "wEmu": w, "hEmu": h, "rotate": 0},
         "style": {
             "fontFamily": "Inter",
-            "fontSize": font_size,
+            "fontSize": fitted_font_size,
             "fontWeight": font_weight,
             "color": color,
             "align": "left",
-            "lineHeight": 1.35,
+            "lineHeight": line_height,
         },
+        "constraints": constraints,
         "zIndex": 10,
         "locked": False,
         "visible": True,
@@ -1197,7 +1346,7 @@ def _image_placeholder_element(
         "fit": "cover",
         "placeholder": slide.visualIntent or "Картинка генерируется…",
         "frame": {"xEmu": x, "yEmu": y, "wEmu": w, "hEmu": h, "rotate": 0},
-        "generation": {"prompt": prompt, "model": "stable-diffusion"},
+        "generation": {"prompt": prompt, "model": _image_model_name()},
         "meta": {"imageGeneration": {"status": "pending", "prompt": prompt}},
         "zIndex": 9,
         "locked": False,
@@ -1436,7 +1585,7 @@ def _attach_asset_to_presentation(presentation_id: str, asset: Asset) -> None:
 
 
 # ---------------------------------------------------------------------------
-# SD image call (synchronous, runs on a worker thread)
+# Image generation providers (synchronous, run on worker threads)
 # ---------------------------------------------------------------------------
 
 
@@ -1445,6 +1594,12 @@ YANDEX_ASPECTS = {"1:1", "16:9", "9:16", "3:2", "2:3", "4:7", "7:4"}
 
 def _image_provider() -> str:
     return os.getenv("RT_AI_IMAGE_PROVIDER", "yandex").strip().lower() or "yandex"
+
+
+def _image_model_name() -> str:
+    if _image_provider() == "sd":
+        return "stable-diffusion"
+    return os.getenv("RT_AI_YANDEX_MODEL", "yandex-art")
 
 
 def _generate_image_asset(prompt: str, image_type: str) -> Asset:
@@ -1588,7 +1743,7 @@ def _craft_image_prompt(
         return f"{slide.title} — illustrative concept for {presentation_title}"
     summary = "; ".join((slide.keyPoints or [])[:3]) or slide.purpose or slide.title
     user_text = (
-        "Create a Stable Diffusion prompt (one line, no JSON) for the following slide.\n\n"
+        "Create an image-generation prompt (one line, no JSON) for the following slide.\n\n"
         f"Presentation: {presentation_title}\n"
         f"Slide title: {slide.title}\n"
         f"Slide intent: {slide.purpose or '-'}\n"
@@ -1630,7 +1785,7 @@ def _replace_slide_in_document(
             prompt = new_outline.imagePrompt or new_outline.visualIntent or new_outline.title
             el.assetId = None
             el.placeholder = new_outline.visualIntent or "Картинка генерируется…"
-            el.generation = {"prompt": prompt, "model": "stable-diffusion"}
+            el.generation = {"prompt": prompt, "model": _image_model_name()}
             el.meta = {
                 **(el.meta or {}),
                 "imageGeneration": {"status": "pending", "prompt": prompt},
@@ -1799,6 +1954,12 @@ def _mock_outline(
 
 
 def _mock_content(
+    source_request: OutlineGenerationRequest, outline: PresentationOutline
+) -> PresentationOutline:
+    return _fallback_content(source_request, outline)
+
+
+def _fallback_content(
     source_request: OutlineGenerationRequest, outline: PresentationOutline
 ) -> PresentationOutline:
     slides: list[OutlineSlide] = []

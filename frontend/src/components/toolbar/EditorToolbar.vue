@@ -33,8 +33,8 @@
 
     <div class="spacer" />
 
-    <button class="tb-btn amber-soft" title="Скоро: AI помощник" @click="askAmurHint">
-      <AcIcon name="sparkle" :size="13" /> Спросить Amur
+    <button class="tb-btn amber-soft" title="Скоро: AI помощник" @click="askAiHint">
+      <AcIcon name="sparkle" :size="13" /> AI помощник
       <span class="ac-kbd" style="background: rgba(255,181,71,0.10); border-color: rgba(255,181,71,0.25); color: var(--amber-200);">⌘K</span>
     </button>
 
@@ -152,7 +152,7 @@ export default {
       const cur = this.editorStore.autoFit ? 1 : this.editorStore.zoom;
       this.editorStore.setZoom(cur - 0.1);
     },
-    askAmurHint() {
+    askAiHint() {
       // Placeholder while AI panel is wired up — keeps the button responsive.
     },
   },

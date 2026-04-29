@@ -1,35 +1,23 @@
 <template>
   <div class="home-shell">
     <header class="home-header">
-      <div class="home-logo">
-        <div class="mark">A</div>
-        <div>
-          <div class="name">Amur Code</div>
-          <div class="tag">AI · Презентации</div>
-        </div>
-      </div>
       <nav class="home-nav">
         <a class="active">Главная</a>
         <a @click.prevent="scrollTo('decks')">Презентации</a>
         <a @click.prevent="scrollTo('templates')">Шаблоны</a>
       </nav>
       <div class="spacer" />
-      <button class="tb-btn ghost" style="gap:8px;">
-        <AcIcon name="search" :size="14" /> Поиск <span class="ac-kbd" style="margin-left:6px;">⌘K</span>
-      </button>
-      <button class="tb-btn icon ghost" title="Уведомления"><AcIcon name="bell" :size="16" /></button>
-      <div class="home-avatar">{{ avatarInitials }}</div>
     </header>
 
     <!-- Hero composer -->
     <section class="hero">
       <div class="hero-top">
-        <span class="ac-chip"><AcIcon name="sparkle" :size="12" /> AI генерация · Amur 4.0</span>
+        <span class="ac-chip"><AcIcon name="sparkle" :size="12" /> AI генерация</span>
         <h1>
           Опиши идею
           <span class="accent">— получи презентацию</span>
         </h1>
-        <p>Amur Code собирает структуру, верстает слайды и экспортирует в PPTX. Вы редактируете — он подстраивается.</p>
+        <p>Редактор собирает структуру, верстает слайды и экспортирует в PPTX. Вы редактируете — он подстраивается.</p>
       </div>
 
       <div class="composer">
@@ -354,9 +342,6 @@ export default {
     };
   },
   computed: {
-    avatarInitials() {
-      return 'А';
-    },
     templateOptionLabels() {
       return this.templates.map((t) => t.name);
     },
